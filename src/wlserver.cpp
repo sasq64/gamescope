@@ -2,6 +2,7 @@
 #define _GNU_SOURCE 1
 
 #include <assert.h>
+#include <float.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>

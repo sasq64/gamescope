@@ -32,6 +32,9 @@ extern bool g_bGrabbed;
 extern float g_mouseSensitivity;
 extern const char *g_sOutputName;
 
+// Ask for a clean shutdown from anywhere; defined in main.cpp.
+void ShutdownGamescope();
+
 enum class GamescopeUpscaleFilter : uint32_t
 {
     LINEAR = 0,

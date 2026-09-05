@@ -11,6 +11,7 @@ namespace gamescope
         OpenVR,
         Headless,
         Wayland,
+        Libretro,
     };
 
     // Backend forward declarations.
@@ -19,4 +20,5 @@ namespace gamescope
     class COpenVRBackend;
     class CHeadlessBackend;
     class CWaylandBackend;
+    class CLibretroBackend;
 }

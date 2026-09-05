@@ -78,6 +78,9 @@ const struct option *gamescope_options = (struct option[]){
 	{ "adaptive-sync", no_argument, nullptr, 0 },
 
 	{ "backend", required_argument, nullptr, 0 },
+#if HAVE_LIBRETRO
+	{ "libretro-fd", required_argument, nullptr, 0 },
+#endif
 
 	// nested mode options
 	{ "nested-unfocused-refresh", required_argument, nullptr, 'o' },
@@ -331,6 +334,11 @@ pthread_t g_mainThread;
 
 static void steamCompMgrThreadRun(int argc, char **argv);
 
+#if HAVE_LIBRETRO
+// Our end of the socketpair the core made before forking us. See Backends/LibretroBackend.cpp.
+extern int g_nLibretroFd;
+#endif
+
 static std::string build_optstring(const struct option *options)
 {
 	std::string optstring;
@@ -440,6 +448,10 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 #endif
 	} else if (strcmp(str, "headless") == 0) {
 		return gamescope::GamescopeBackend::Headless;
+#if HAVE_LIBRETRO
+	} else if (strcmp(str, "libretro") == 0) {
+		return gamescope::GamescopeBackend::Libretro;
+#endif
 	} else if (strcmp(str, "wayland") == 0) {
 		return gamescope::GamescopeBackend::Wayland;
 	} else {
@@ -846,6 +858,10 @@ int main(int argc, char **argv)
 					g_bExposeWayland = true;
 				} else if (strcmp(opt_name, "backend") == 0) {
 					eCurrentBackend = parse_backend_name( optarg );
+#if HAVE_LIBRETRO
+				} else if (strcmp(opt_name, "libretro-fd") == 0) {
+					g_nLibretroFd = parse_integer(optarg, opt_name);
+#endif
 				} else if (strcmp(opt_name, "cursor-scale-height") == 0) {
 					g_nCursorScaleHeight = parse_integer(optarg, opt_name);
 				} else if (strcmp(opt_name, "mangoapp") == 0) {
@@ -1003,6 +1019,12 @@ int main(int argc, char **argv)
 		case gamescope::GamescopeBackend::Headless:
 			gamescope::IBackend::Set<gamescope::CHeadlessBackend>();
 			break;
+
+#if HAVE_LIBRETRO
+		case gamescope::GamescopeBackend::Libretro:
+			gamescope::IBackend::Set<gamescope::CLibretroBackend>();
+			break;
+#endif
 
 		case gamescope::GamescopeBackend::Wayland:
 			gamescope::IBackend::Set<gamescope::CWaylandBackend>();

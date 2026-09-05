@@ -145,8 +145,14 @@ if sdl2_dep.found()
   src += 'Backends/SDLBackend.cpp'
 endif
 
+libretro_opt = get_option('libretro_backend')
+if not libretro_opt.disabled()
+  src += 'Backends/LibretroBackend.cpp'
+endif
+
 gamescope_cpp_args += '-DHAVE_DRM=@0@'.format(drm_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_SDL2=@0@'.format(sdl2_dep.found().to_int())
+gamescope_cpp_args += '-DHAVE_LIBRETRO=@0@'.format((not libretro_opt.disabled()).to_int())
 gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
@@ -227,3 +233,22 @@ executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamesc
 executable('gamescope-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
 executable('gamescope_hotkey_example', ['Apps/gamescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )
+
+if not libretro_opt.disabled()
+  shared_library(
+    'gamescope_libretro',
+    ['libretro/core.cpp'],
+    name_prefix: '',
+    dependencies: [thread_dep],
+    cpp_args: [
+      # The core has to find the compositor it forks, and cannot do it by looking
+      # beside itself: a frontend may load the library from a private copy (demarc
+      # copies every core into a temp dir so two instances get separate globals),
+      # which puts the .so somewhere with no gamescope next to it. Both the build
+      # location and the install location are baked in; see FindGamescope().
+      '-DGAMESCOPE_BUILD_BIN="@0@"'.format(meson.current_build_dir() / 'gamescope'),
+      '-DGAMESCOPE_INSTALL_BIN="@0@"'.format(get_option('prefix') / get_option('bindir') / 'gamescope'),
+    ],
+    install: false,
+  )
+endif
