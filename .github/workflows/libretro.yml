@@ -260,11 +260,20 @@ jobs:
         with:
           path: dist
 
+      # Found rather than named: whether the download lands the zip in a directory
+      # per artifact or straight in dist/ is the action's business, and it has
+      # changed before.
       - name: Stage release assets
         run: |
           set -euo pipefail
           mkdir -p release
-          cp dist/gamescope_libretro-linux-x86_64/gamescope_libretro-linux-x86_64.zip release/
+          zip="$(find dist -name 'gamescope_libretro-linux-x86_64.zip' -print -quit)"
+          if [ -z "$zip" ]; then
+            echo "the build artifact holds no gamescope_libretro-linux-x86_64.zip:" >&2
+            find dist >&2
+            exit 1
+          fi
+          cp "$zip" release/
           ls -l release
 
       - name: Write manifest.json
