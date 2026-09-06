@@ -77,7 +77,10 @@ const retro_variable k_Variables[] = {
     // Free-form on purpose: the announced list is only what a picker would show, and a
     // value the frontend already holds (demarc's -x gamescope_command=...) beats it.
     { "gamescope_command",    "Command to run; |wine|chrome" },
-    { "gamescope_wine_desktop", "Wine virtual desktop; false|true" },
+    // No wine_desktop option: a virtual desktop is `explorer /desktop=` in front of the
+    // command, and the command is the frontend's to build -- demarc's capture_meta()
+    // puts it there. An option here would be a second way to say it that this end could
+    // only honour by rewriting somebody else's argv.
     { "gamescope_expose_wayland", "Give the client gamescope's Wayland socket; false|true" },
     // No sensible list to offer, so the announced default is empty and the value
     // comes from the frontend. demarc points it at the same prefix wine_emu uses.
@@ -239,24 +242,53 @@ void SendInput( uint32_t uType, uint32_t uCode, int32_t nValue, float flX, float
 // ---------------------------------------------------------------------------
 // Finding the compositor
 //
-// In a build tree gamescope sits beside this library, which is how a locally built core
-// is tested (demarc's DEMARC_CORE_DIR points straight at the meson build directory).
-// An installed core falls back to PATH.
+// A downloaded core has the compositor unpacked beside it (see
+// .github/workflows/libretro.yml, which zips the two together); in a build tree
+// gamescope sits beside this library too, which is how a locally built core is tested
+// (demarc's DEMARC_CORE_DIR points straight at the meson build directory). An installed
+// core falls back to PATH.
 // ---------------------------------------------------------------------------
+
+// The directory the frontend loaded this library from, empty if it will not say.
+//
+// Asked of the frontend rather than worked out from `dladdr`, because the two answer
+// different questions: a frontend may load us from a private copy in a temp directory
+// -- which is exactly what demarc does so that two instances of a core do not share
+// globals -- and nothing useful sits next to that copy. GET_LIBRETRO_PATH names the
+// library as it lives on disk, which is where the compositor was unpacked.
+std::string LibraryDir()
+{
+    const char *pszPath = nullptr;
+    if ( !env_cb || !env_cb( RETRO_ENVIRONMENT_GET_LIBRETRO_PATH, &pszPath ) || !pszPath )
+        return {};
+
+    const char *pszSlash = strrchr( pszPath, '/' );
+    if ( !pszSlash )
+        return {};
+
+    return std::string( pszPath, pszSlash - pszPath );
+}
 
 std::string FindGamescope()
 {
     if ( const char *pszOverride = getenv( "GAMESCOPE_LIBRETRO_BIN" ) )
         return pszOverride;
 
-    // Looking beside the library would be the obvious thing and is wrong: a frontend
-    // may load us from a private copy in a temp directory, which is exactly what demarc
-    // does so that two instances of a core do not share globals. Nothing useful sits
-    // next to that copy. The build and install locations are baked in instead.
-    for ( const char *pszCandidate : { GAMESCOPE_BUILD_BIN, GAMESCOPE_INSTALL_BIN } )
+    std::vector<std::string> candidates;
+
+    std::string strDir = LibraryDir();
+    if ( !strDir.empty() )
+        candidates.push_back( strDir + "/gamescope" );
+
+    // The build and install locations are baked in, and are what a core loaded from a
+    // copy of itself has left to go on.
+    candidates.push_back( GAMESCOPE_BUILD_BIN );
+    candidates.push_back( GAMESCOPE_INSTALL_BIN );
+
+    for ( const std::string &strCandidate : candidates )
     {
-        if ( access( pszCandidate, X_OK ) == 0 )
-            return pszCandidate;
+        if ( access( strCandidate.c_str(), X_OK ) == 0 )
+            return strCandidate;
     }
 
     return "gamescope";
@@ -332,11 +364,37 @@ std::string ProfileDir()
     return strDir;
 }
 
-// Split a command option on spaces. Deliberately naive -- it exists so
-// `-x gamescope_command="vkcube --gpu 0"` works for testing, not to be a shell.
+// The separator demarc puts between the words of a command it built itself. ASCII
+// US: it exists for exactly this and cannot occur in a path, which spaces very much
+// can -- demo filenames are full of them, and the wine command demarc sends has a
+// demo path and a driver path in it.
+const char k_chArgSeparator = '\x1f';
+
+// Split a command option into an argv.
+//
+// On the separator when there is one, which is a command assembled by the frontend
+// and already split; on whitespace otherwise, which is a command someone typed
+// (`-x gamescope_command="vkcube --gpu 0"`). Deliberately naive in the second case:
+// it exists for testing, not to be a shell.
 std::vector<std::string> SplitWords( const std::string &str )
 {
     std::vector<std::string> words;
+
+    if ( str.find( k_chArgSeparator ) != std::string::npos )
+    {
+        size_t start = 0;
+        while ( start <= str.size() )
+        {
+            size_t at = str.find( k_chArgSeparator, start );
+            if ( at == std::string::npos )
+                at = str.size();
+            if ( at > start )
+                words.push_back( str.substr( start, at - start ) );
+            start = at + 1;
+        }
+        return words;
+    }
+
     size_t i = 0;
     while ( i < str.size() )
     {
@@ -371,12 +429,23 @@ Client BuildClient( const std::string &strPath )
     std::string strCommand = GetOption( "gamescope_command", "" );
 
     // An explicit command wins, and is the only way to run something that is not a file
-    // -- which is how the backend gets tested against glxgears or a terminal.
+    // -- which is how the backend gets tested against glxgears or a terminal, and how
+    // demarc sends the whole wine command it would otherwise have run on top of itself:
+    // the dialog driver, the demo, and a virtual desktop around them if one was asked
+    // for. See capture_meta() in demarc's src/newsys/windows.rs.
     if ( !strCommand.empty() && strCommand != "wine" && strCommand != "chrome" )
     {
         Client client;
         client.argv = SplitWords( strCommand );
         client.bExposeWayland = GetOption( "gamescope_expose_wayland", "false" ) == "true";
+        // The release's own directory, for the same reason as below: a demo that ships
+        // a data/ folder or its own fmod.dll finds neither from anywhere else. The
+        // command may name a program that has nothing to do with the loaded file, but
+        // the directory of the file we were given is still the best guess there is, and
+        // for a command wrapped around that very file it is the right one.
+        size_t uSlash = strPath.rfind( '/' );
+        if ( uSlash != std::string::npos )
+            client.strWorkDir = strPath.substr( 0, uSlash );
         return client;
     }
 
@@ -568,6 +637,7 @@ bool SpawnCompositor( const Client &client )
     }
 
     std::string strBin = FindGamescope();
+    log_line( RETRO_LOG_INFO, "compositor: %s", strBin.c_str() );
 
     const unsigned uWidth = g_Session.uWidth;
     const unsigned uHeight = g_Session.uHeight;

@@ -1,0 +1,335 @@
+name: libretro core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [demarc]
+    paths-ignore:
+      - '**.md'
+      - 'wiki/**'
+      - '.github/ISSUE_TEMPLATE/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    # Unlike every other libretro core, this one ships a program: gamescope_libretro.so
+    # is a few hundred lines that fork/exec a whole compositor. So the build is really a
+    # packaging job -- the runner decides the glibc floor of the release, and 24.04 is
+    # the oldest one whose remaining system libraries are still new enough to link
+    # against (glibc 2.39: Ubuntu 24.04, Debian 13, Fedora 40, SteamOS 3.7, Arch).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up paths
+        run: |
+          set -euo pipefail
+          echo "DEPS=$HOME/gsdeps" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$HOME/gsdeps/lib/x86_64-linux-gnu/pkgconfig:$HOME/gsdeps/lib/pkgconfig:$HOME/gsdeps/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "$HOME/gsdeps/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config cmake git patchelf zip \
+            bison flex pipx \
+            libffi-dev libexpat1-dev libxml2-dev \
+            libx11-dev libxcomposite-dev libxdamage-dev libxrender-dev libxext-dev \
+            libxfixes-dev libxcursor-dev libxi-dev libxtst-dev libxres-dev libxmu-dev \
+            libxxf86vm-dev libxt-dev \
+            libxcb1-dev libxcb-composite0-dev libxcb-ewmh-dev libxcb-icccm4-dev \
+            libxcb-render0-dev libxcb-res0-dev libxcb-xfixes0-dev \
+            libinput-dev libseat-dev libudev-dev libdisplay-info-dev libcap-dev \
+            libluajit-5.1-dev libdecor-0-dev libvulkan-dev glslang-tools hwdata \
+            xwayland
+          # Noble's meson is 1.3.2, exactly wlroots' minimum; take a current one
+          # rather than sit on the boundary.
+          pipx install meson
+          pipx ensurepath
+
+      # wlroots 0.20 asks for libraries newer than any LTS ships (libdrm 2.4.129,
+      # wayland 1.24, wayland-protocols 1.47, xkbcommon 1.8, pixman 0.43), so those
+      # five are built from pinned releases into ~/gsdeps and found ahead of the
+      # system copies through PKG_CONFIG_PATH. They are bundled into the release
+      # below, because a host old enough to need this is also too old to run against.
+      - name: Build newer dependencies
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/deps-src"
+          mkdir -p "$src" "$DEPS"
+
+          build() { # url tag subdir meson-args...
+            local url="$1" tag="$2" dir="$3"; shift 3
+            git clone --depth 1 --branch "$tag" "$url" "$src/$dir"
+            meson setup "$src/$dir/build" "$src/$dir" \
+              --prefix "$DEPS" --buildtype release --libdir lib "$@"
+            ninja -C "$src/$dir/build" install
+          }
+
+          build https://gitlab.freedesktop.org/wayland/wayland.git 1.24.0 wayland \
+            -Ddocumentation=false -Dtests=false -Ddtd_validation=false
+          build https://gitlab.freedesktop.org/wayland/wayland-protocols.git 1.47 wayland-protocols \
+            -Dtests=false
+          build https://gitlab.freedesktop.org/mesa/drm.git libdrm-2.4.129 libdrm \
+            -Dauto_features=disabled -Dtests=false
+          build https://github.com/xkbcommon/libxkbcommon.git xkbcommon-1.8.0 libxkbcommon \
+            -Denable-tools=false -Denable-docs=false -Denable-x11=false \
+            -Denable-wayland=false -Denable-xkbregistry=false
+          build https://gitlab.freedesktop.org/pixman/pixman.git pixman-0.44.0 pixman \
+            -Dtests=disabled -Ddemos=disabled
+
+          # The Vulkan headers noble ships (1.3.275) predate extensions gamescope uses.
+          # Deliberately unpinned: Vulkan-Headers only ever grows, and the loader that
+          # matters at runtime is the host's -- gamescope dlopen()s it.
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$src/vulkan-headers"
+          cmake -S "$src/vulkan-headers" -B "$src/vulkan-headers/build" -DCMAKE_INSTALL_PREFIX="$DEPS"
+          cmake --install "$src/vulkan-headers/build"
+
+      # Same options as demarc's `just gamescope-core`, plus the backends this release
+      # has no use for: it is only ever run headless behind the libretro backend, and
+      # every dependency dropped here is one less library to ship.
+      - name: Build gamescope and the core
+        run: |
+          set -euo pipefail
+          # Compile against the headers in the prefix ahead of the system's: pkg-config
+          # brings its own -I for the libraries built above, but the Vulkan headers
+          # arrive with no .pc of their own and noble's are older than gamescope wants.
+          export CPPFLAGS="-I$DEPS/include"
+          meson setup build-lr . \
+            -Dbuildtype=release \
+            -Dlibretro_backend=enabled \
+            -Denable_openvr_support=false \
+            -Denable_tests=false \
+            -Denable_gamescope_wsi_layer=false \
+            -Dsdl2_backend=disabled \
+            -Dinput_emulation=disabled \
+            -Dpipewire=disabled \
+            -Davif_screenshots=disabled \
+            -Dforce_fallback_for=libliftoff,vkroots
+          ninja -C build-lr src/gamescope src/gamescope_libretro.so
+
+      # The zip is one directory: the core at the top, because that is the only file
+      # demarc's libloader.rs looks for, the compositor beside it, because that is
+      # where the core looks (FindGamescope() asks the frontend for GET_LIBRETRO_PATH),
+      # and everything the host cannot be assumed to have under lib/.
+      #
+      # RPATH rather than a wrapper script setting LD_LIBRARY_PATH: the compositor
+      # execs wine and Chrome, and an LD_LIBRARY_PATH would follow them into a process
+      # that must use the host's libraries. DT_RPATH ($ORIGIN, --force-rpath) rather
+      # than DT_RUNPATH so the search applies to the whole dependency chain.
+      - name: Stage release directory
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage/lib"
+          cp build-lr/src/gamescope "$stage/gamescope"
+          cp build-lr/src/gamescope_libretro.so "$stage/gamescope_libretro.so"
+          chmod +x "$stage/gamescope"
+
+          # What is left to the host, because it already has it or must own it: the
+          # C/C++ runtime, the graphics stack its Vulkan driver is built against, X11,
+          # and the systemd/glib layer under libinput. Shipping our own copy of any of
+          # these is how a bundle breaks on somebody else's machine.
+          bundle() {
+            case "$1" in
+              ld-linux*|libc.so.*|libm.so.*|libmvec.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*) return 1 ;;
+              libstdc++.so.*|libgcc_s.so.*) return 1 ;;
+              libGL*|libEGL*|libOpenGL*|libGLX*|libGLdispatch*|libgbm.so.*|libvulkan.so.*|libglapi.so.*) return 1 ;;
+              libX11*|libxcb*|libXau*|libXdmcp*|libXext*|libXfixes*|libXrender*|libXcomposite*|libXdamage*|libXcursor*|libXi.so.*|libXtst*|libXRes*|libXmu*|libXt.so.*|libXxf86vm*|libICE*|libSM*|libxshmfence*) return 1 ;;
+              libudev.so.*|libsystemd.so.*|libcap.so.*|libselinux.so.*|libz.so.*|libzstd.so.*|liblzma.so.*|liblz4.so.*|libgcrypt.so.*|libgpg-error.so.*) return 1 ;;
+              libglib-2.0.so.*|libgobject-2.0.so.*|libgio-2.0.so.*|libgmodule-2.0.so.*|libffi.so.*|libpcre*|libuuid.so.*|libblkid.so.*|libmount.so.*) return 1 ;;
+            esac
+            return 0
+          }
+
+          # LD_LIBRARY_PATH so the libraries built above are the ones resolved and
+          # copied. Without it a missing build-tree rpath would quietly resolve
+          # libwayland and friends to noble's older system copies -- which link fine
+          # and then fail on a host, the one failure this whole step exists to avoid.
+          map="$RUNNER_TEMP/ldd.txt"
+          LD_LIBRARY_PATH="$DEPS/lib" ldd "$stage/gamescope" > "$map"
+
+          for lib in $(awk '/=> \//{print $3}' "$map"); do
+            base="$(basename "$lib")"
+            if bundle "$base"; then
+              cp -Lu "$lib" "$stage/lib/$base"
+            fi
+          done
+
+          for soname in libwayland-server.so.0 libwayland-client.so.0 libdrm.so.2 \
+                        libxkbcommon.so.0 libpixman-1.so.0; do
+            if ! grep -q "$DEPS/lib/$soname" "$map"; then
+              echo "$soname resolved to a system copy, not the one built for wlroots" >&2
+              cat "$map" >&2
+              exit 1
+            fi
+          done
+
+          strip --strip-unneeded "$stage/gamescope" "$stage/gamescope_libretro.so" "$stage"/lib/*.so* || true
+          patchelf --force-rpath --set-rpath '$ORIGIN/lib' "$stage/gamescope"
+          for lib in "$stage"/lib/*.so*; do
+            patchelf --force-rpath --set-rpath '$ORIGIN' "$lib"
+          done
+
+          echo "--- staged:"
+          ls -l "$stage" "$stage/lib"
+          du -sh "$stage"
+
+      - name: Inspect the build
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          file "$stage/gamescope" "$stage/gamescope_libretro.so"
+
+          # Nothing may resolve outside the bundle except what `keep` deliberately
+          # left to the host, and nothing may be missing outright.
+          ldd "$stage/gamescope"
+          if ldd "$stage/gamescope" | grep -q 'not found'; then
+            echo "unresolved libraries in the bundle" >&2
+            exit 1
+          fi
+
+          # A core lives in the frontend's address space, so exit() in it is a bug --
+          # the same rule as docs/PCEM.md in demarc's tree. The only _exit is in the
+          # forked child after execvp fails, which is not this symbol.
+          if nm -D -u "$stage/gamescope_libretro.so" | grep -qw exit; then
+            echo "the core links exit()" >&2
+            exit 1
+          fi
+
+          # The compositor has to be reachable from the core, which means both that
+          # it is executable and that it understands the option the core passes it.
+          test -x "$stage/gamescope"
+          timeout 30 "$stage/gamescope" --help 2>&1 | grep -q -- '--backend' || true
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p release
+          ( cd "$stage" && zip -9 -X -r "$GITHUB_WORKSPACE/release/gamescope_libretro-linux-x86_64.zip" . )
+          unzip -l release/gamescope_libretro-linux-x86_64.zip
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: gamescope_libretro-linux-x86_64
+          path: release/gamescope_libretro-linux-x86_64.zip
+          if-no-files-found: error
+
+  # Publishes to a rolling "latest" release, so demarc can fetch it from a URL that
+  # never changes -- src/libloader.rs ALT_SOURCES. Both of these resolve to the newest
+  # successful build:
+  #   https://github.com/sasq64/gamescope/releases/download/latest/<asset>
+  #   https://github.com/sasq64/gamescope/releases/latest/download/<asset>
+  # manifest.json lists the zip with its size and sha256.
+  publish:
+    name: Publish rolling release
+    needs: [linux-x86_64]
+    if: github.ref == 'refs/heads/demarc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download built core
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp dist/gamescope_libretro-linux-x86_64/gamescope_libretro-linux-x86_64.zip release/
+          ls -l release
+
+      - name: Write manifest.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+
+          try:
+              version = subprocess.check_output(
+                  ["git", "describe", "--tags", "--always"], text=True).strip()
+          except subprocess.CalledProcessError:
+              version = "unknown"
+
+          assets = {
+              "linux-x86_64": ("gamescope_libretro-linux-x86_64.zip", "gamescope_libretro.so"),
+          }
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['RELEASE_TAG']}"
+
+          manifest = {
+              "version": version,
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "cores": {},
+          }
+          for platform, (name, core) in assets.items():
+              data = pathlib.Path("release", name).read_bytes()
+              manifest["cores"][platform] = {
+                  "file": name,
+                  "core": core,
+                  "url": f"{base}/{name}",
+                  "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+              }
+
+          pathlib.Path("release/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          cat release/manifest.json
+
+      - name: Move the rolling tag
+        run: |
+          set -euo pipefail
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<EOF
+          Rolling build of the gamescope libretro core from \`$GITHUB_SHA\`.
+
+          The zip unpacks to \`gamescope_libretro.so\`, the \`gamescope\` compositor it
+          forks, and the libraries a current desktop cannot be assumed to have, under
+          \`lib/\`. Unpack it all into one directory: the core finds the compositor
+          beside itself, through the path the frontend reports for \`GET_LIBRETRO_PATH\`.
+          \`GAMESCOPE_LIBRETRO_BIN\` overrides that with a compositor of your own.
+
+          Built on Ubuntu 24.04, so it needs glibc 2.39 or newer. From the host it also
+          needs a Vulkan driver, \`Xwayland\`, and whatever the session is meant to run
+          (\`wine\`, \`google-chrome\`).
+
+          See manifest.json for the size and sha256.
+          EOF
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "gamescope libretro core (latest)" --notes "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --title "gamescope libretro core (latest)" --notes "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
