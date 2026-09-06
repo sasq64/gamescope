@@ -89,6 +89,11 @@ const retro_variable k_Variables[] = {
     // it in from the DLLs a release ships beside its .exe -- see wine_dll_overrides in
     // src/newsys/windows.rs.
     { "gamescope_wine_dll_overrides", "WINEDLLOVERRIDES for a wine client; " },
+    // Whether teardown ends wine in the prefix -- see StopWineServer. True on its own,
+    // because a core left to itself is the only thing that can. A frontend running
+    // several sessions in one prefix sets this false and closes the prefix itself once
+    // the last of them has gone; demarc's capture_meta() does exactly that.
+    { "gamescope_close_prefix", "Shut the WINEPREFIX down on unload; true|false" },
     { nullptr, nullptr },
 };
 
@@ -529,7 +534,11 @@ Client BuildClient( const std::string &strPath )
 // still up; see the call site.
 //
 // Wholesale, like wine_emu.rs's close_prefix: it ends every wine process in the prefix,
-// so two wine sessions sharing one prefix cannot be closed independently.
+// so two wine sessions sharing one prefix cannot be closed independently. Which is why
+// the frontend can take it over: `gamescope_close_prefix=false` leaves strWinePrefix
+// empty and this a no-op, and demarc -- who is the only one that knows how many sessions
+// it has in there -- closes the prefix once the last of them is gone. See PrefixGuard in
+// src/wine_emu.rs.
 void StopWineServer()
 {
     if ( g_Session.strWinePrefix.empty() )
@@ -692,8 +701,14 @@ bool SpawnCompositor( const Client &client )
     if ( !strPrefix.empty() )
     {
         childEnv.emplace_back( "WINEPREFIX", strPrefix );
-        if ( !client.argv.empty() && client.argv[0] == "wine" )
+        // Recording it is what arms StopWineServer, so a frontend that owns the prefix's
+        // lifetime turns teardown off simply by not letting it be recorded.
+        const bool bClosePrefix = GetOption( "gamescope_close_prefix", "true" ) != "false";
+        if ( bClosePrefix && !client.argv.empty() && client.argv[0] == "wine" )
             g_Session.strWinePrefix = strPrefix;
+        else if ( !bClosePrefix )
+            log_line( RETRO_LOG_INFO, "Leaving the wine prefix %s to the frontend to close",
+                      strPrefix.c_str() );
     }
 
     std::string strDllOverrides = GetOption( "gamescope_wine_dll_overrides", "" );
