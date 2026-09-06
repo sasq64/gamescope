@@ -85,6 +85,10 @@ const retro_variable k_Variables[] = {
     // No sensible list to offer, so the announced default is empty and the value
     // comes from the frontend. demarc points it at the same prefix wine_emu uses.
     { "gamescope_wineprefix", "WINEPREFIX for a wine client; " },
+    // Same again: wine's own syntax ("d3dx9_37=n"), passed through unread. demarc fills
+    // it in from the DLLs a release ships beside its .exe -- see wine_dll_overrides in
+    // src/newsys/windows.rs.
+    { "gamescope_wine_dll_overrides", "WINEDLLOVERRIDES for a wine client; " },
     { nullptr, nullptr },
 };
 
@@ -690,6 +694,13 @@ bool SpawnCompositor( const Client &client )
         childEnv.emplace_back( "WINEPREFIX", strPrefix );
         if ( !client.argv.empty() && client.argv[0] == "wine" )
             g_Session.strWinePrefix = strPrefix;
+    }
+
+    std::string strDllOverrides = GetOption( "gamescope_wine_dll_overrides", "" );
+    if ( !strDllOverrides.empty() )
+    {
+        childEnv.emplace_back( "WINEDLLOVERRIDES", strDllOverrides );
+        log_line( RETRO_LOG_INFO, "WINEDLLOVERRIDES=%s", strDllOverrides.c_str() );
     }
 
     // wine is loud enough on its own to fill a pipe. The frontend can turn it back
