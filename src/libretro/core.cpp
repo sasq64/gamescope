@@ -89,6 +89,14 @@ const retro_variable k_Variables[] = {
     // it in from the DLLs a release ships beside its .exe -- see wine_dll_overrides in
     // src/newsys/windows.rs.
     { "gamescope_wine_dll_overrides", "WINEDLLOVERRIDES for a wine client; " },
+    // MESA_GL_VERSION_OVERRIDE for the client, passed through unread. The value that
+    // matters is "4.6COMPAT": wine's wglGetProcAddress only hands back the legacy
+    // ARB/EXT aliases (glActiveTextureARB and friends) when the current context
+    // advertises the extension they belong to, which a core-profile context does not,
+    // and a GL demo that resolves its entry points without checking them calls the
+    // resulting NULL. Asking Mesa for a compatibility profile puts the strings back.
+    // demarc's capture_meta() sets it from wine_gl_compat -- see src/newsys/windows.rs.
+    { "gamescope_mesa_gl_version_override", "MESA_GL_VERSION_OVERRIDE for the client; " },
     // Whether teardown ends wine in the prefix -- see StopWineServer. True on its own,
     // because a core left to itself is the only thing that can. A frontend running
     // several sessions in one prefix sets this false and closes the prefix itself once
@@ -716,6 +724,15 @@ bool SpawnCompositor( const Client &client )
     {
         childEnv.emplace_back( "WINEDLLOVERRIDES", strDllOverrides );
         log_line( RETRO_LOG_INFO, "WINEDLLOVERRIDES=%s", strDllOverrides.c_str() );
+    }
+
+    // Only the client gets this, not the gamescope we are running inside: the child is
+    // the only thing forked here, and gamescope composites through Vulkan anyway.
+    std::string strGlVersion = GetOption( "gamescope_mesa_gl_version_override", "" );
+    if ( !strGlVersion.empty() )
+    {
+        childEnv.emplace_back( "MESA_GL_VERSION_OVERRIDE", strGlVersion );
+        log_line( RETRO_LOG_INFO, "MESA_GL_VERSION_OVERRIDE=%s", strGlVersion.c_str() );
     }
 
     // wine is loud enough on its own to fill a pipe. The frontend can turn it back
