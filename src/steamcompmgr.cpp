@@ -2397,6 +2397,21 @@ void MouseCursor::updateCursorFeedback( bool bForce )
 	m_needs_server_flush = true;
 }
 
+// The window transform has already been restored into frameInfo, and vulkanTex is
+// the commit as the client made it, so undoing the scale gives the output rect.
+static void
+set_cached_coverage( struct FrameInfo_t *frameInfo, const gamescope::Rc<commit_t>& commit )
+{
+	const vec2_t scale = frameInfo->focusedWindowScale;
+	if ( !commit->vulkanTex || scale.x <= 0.0f || scale.y <= 0.0f )
+		return;
+
+	frameInfo->focusedWindowCoverage = {
+		commit->vulkanTex->width() / scale.x,
+		commit->vulkanTex->height() / scale.y,
+	};
+}
+
 static void
 paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerInfo_t& base, struct FrameInfo_t *frameInfo, float flOpacityScale, bool bOverrideOpacity )
 {
@@ -2430,6 +2445,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 		}
 		frameInfo->focusedWindowScale = { layer->scale.x, layer->scale.y };
 		frameInfo->focusedWindowOffset = { layer->offset.x, layer->offset.y };
+		set_cached_coverage( frameInfo, commit );
 	}
 	else
 	{
@@ -2439,6 +2455,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 		layer->offset = { 0.0f, 0.0f };
 		frameInfo->focusedWindowScale = { base.windowScale[0], base.windowScale[1] };
 		frameInfo->focusedWindowOffset = { base.windowOffset[0], base.windowOffset[1] };
+		set_cached_coverage( frameInfo, commit );
 	}
 
 	layer->hdr_metadata_blob = nullptr;
@@ -2631,6 +2648,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 
 	frameInfo->focusedWindowScale = { 1.0f / baseScaleRatio_x, 1.0f / baseScaleRatio_y };
 	frameInfo->focusedWindowOffset = { float( -baseXOffset ), float( -baseYOffset ) };
+	frameInfo->focusedWindowCoverage = { baseWidth * baseScaleRatio_x, baseHeight * baseScaleRatio_y };
 
 	layer->blackBorder = flags & PaintWindowFlag::DrawBorders;
 

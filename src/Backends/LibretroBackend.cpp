@@ -23,6 +23,7 @@
 
 #include "../libretro/gamescope_libretro_ipc.h"
 
+#include <algorithm>
 #include <atomic>
 #include <thread>
 
@@ -199,6 +200,8 @@ namespace gamescope
             gslr_frame frame = {};
             frame.slot = uint32_t( nSlot );
             frame.serial = ++m_ulSerial;
+            frame.used_width = ClampCoverage( pFrameInfo->focusedWindowCoverage.x, g_nOutputWidth );
+            frame.used_height = ClampCoverage( pFrameInfo->focusedWindowCoverage.y, g_nOutputHeight );
 
             if ( !SendMessage( g_nLibretroFd, GSLR_MSG_FRAME, &frame, sizeof( frame ) ) )
             {
@@ -214,6 +217,15 @@ namespace gamescope
         gamescope::Rc<CVulkanTexture> m_Ring[ GSLR_NUM_BUFFERS ];
 
     private:
+        static uint32_t ClampCoverage( float flCoverage, int nOutput )
+        {
+            int nRounded = int( flCoverage + 0.5f );
+            if ( nRounded <= 0 )
+                return 0;
+
+            return uint32_t( std::min( nRounded, nOutput ) );
+        }
+
         BackendConnectorHDRInfo m_HDRInfo{};
         uint64_t m_ulSerial = 0;
     };

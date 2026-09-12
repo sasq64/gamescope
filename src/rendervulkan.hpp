@@ -301,6 +301,11 @@ struct FrameInfo_t
 	vec2_t focusedWindowScale = { 1.0f, 1.0f };
 	vec2_t focusedWindowOffset = { 0.0f, 0.0f };
 
+	// Output pixels the focused window covers once scaled, centred in the output.
+	// The libretro backend passes it on so the frontend can tell a 4:3 client
+	// letterboxed into a 16:9 session from one that fills it.
+	vec2_t focusedWindowCoverage = { 0.0f, 0.0f };
+
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;

@@ -18,7 +18,7 @@
 
 #include <stdint.h>
 
-#define GSLR_PROTOCOL_VERSION 1u
+#define GSLR_PROTOCOL_VERSION 2u
 
 // Buffers in the ring. Three lets gamescope compose the next frame while the core
 // still holds the last one, without ever waiting on it.
@@ -65,6 +65,12 @@ struct gslr_frame
     uint32_t slot;
     uint32_t _pad;
     uint64_t serial; // monotonic, so a dropped FRAME is visible as a gap
+
+    // The centred part of the frame the focused window actually covers, in frame
+    // pixels: a 640x480 client in a 1280x1024 session is scaled to 1280x960 and
+    // the rest is border. 0 when there is nothing focused to measure.
+    uint32_t used_width;
+    uint32_t used_height;
 };
 
 struct gslr_release

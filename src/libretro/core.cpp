@@ -202,6 +202,11 @@ struct Session
     unsigned uHeight = 600;
     double   flFps = 60.0;
 
+    // What the last frame's client actually covered of that, reported to the frontend
+    // as the geometry's base size. 0 until gamescope has told us.
+    unsigned uUsedWidth = 0;
+    unsigned uUsedHeight = 0;
+
     // The last frame we handed to video_refresh, kept so a tick with nothing new can
     // repeat it rather than flash black.
     int nLastSlot = -1;
@@ -941,12 +946,44 @@ void PublishFrame( int nSlot )
     SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
 }
 
+// A client that changes mode changes how much of the session it covers, which is the
+// only thing the frontend can use to tell a 4:3 release in a 16:9 session from a
+// borderless one. The frame keeps arriving whole, border included, so the geometry's
+// display aspect stays the session's and only the base size follows the client.
+void SetUsedSize( unsigned uWidth, unsigned uHeight )
+{
+    if ( !uWidth || !uHeight )
+        return;
+
+    if ( uWidth == g_Session.uUsedWidth && uHeight == g_Session.uUsedHeight )
+        return;
+
+    g_Session.uUsedWidth = uWidth;
+    g_Session.uUsedHeight = uHeight;
+
+    if ( !env_cb )
+        return;
+
+    retro_game_geometry geom = {};
+    geom.base_width = uWidth;
+    geom.base_height = uHeight;
+    geom.max_width = g_Session.uWidth;
+    geom.max_height = g_Session.uHeight;
+    geom.aspect_ratio = float( g_Session.uWidth ) / float( g_Session.uHeight );
+
+    env_cb( RETRO_ENVIRONMENT_SET_GEOMETRY, &geom );
+
+    log_line( RETRO_LOG_INFO, "client covers %ux%u of %ux%u",
+              uWidth, uHeight, g_Session.uWidth, g_Session.uHeight );
+}
+
 // Reads whatever the compositor has queued, keeping only the newest frame: if we fell
 // behind, the older ones are stale by definition and showing them would only add lag.
 // Returns the slot to present, or -1 for nothing new.
 int DrainFrames()
 {
     int nNewest = -1;
+    unsigned uUsedWidth = 0, uUsedHeight = 0;
 
     for ( ;; )
     {
@@ -989,6 +1026,8 @@ int DrainFrames()
                 SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
             }
             nNewest = int( msg.frame.slot );
+            uUsedWidth = msg.frame.used_width;
+            uUsedHeight = msg.frame.used_height;
         }
         else if ( msg.header.type == GSLR_MSG_BYE )
         {
@@ -999,6 +1038,9 @@ int DrainFrames()
 
     if ( nNewest >= 0 && unsigned( nNewest ) >= g_Session.uNumBuffers )
         return -1;
+
+    if ( nNewest >= 0 )
+        SetUsedSize( uUsedWidth, uUsedHeight );
 
     return nNewest;
 }
@@ -1156,6 +1198,9 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
     // in here makes a sound yet. See the audio milestone in docs/GAMESCOPE.md.
     size_t uFrames = size_t( 48000.0 / g_Session.flFps );
     g_Session.Silence.assign( uFrames * 2, 0 );
+
+    g_Session.uUsedWidth = 0;
+    g_Session.uUsedHeight = 0;
 
     g_Session.bRunning = true;
     g_Session.bReportedExit = false;
