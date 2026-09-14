@@ -404,14 +404,20 @@ std::vector<std::string> SplitWords( const std::string &str )
 
     if ( str.find( k_chArgSeparator ) != std::string::npos )
     {
+        // One word per field, empty ones included. An argv element is allowed to
+        // be the empty string and dropping it silently shifts everything after
+        // it along by one -- which is how `--chdir '' --` once reached bwrap as
+        // `--chdir --`, and bwrap tried to enter a directory called "--".
         size_t start = 0;
-        while ( start <= str.size() )
+        for ( ;; )
         {
             size_t at = str.find( k_chArgSeparator, start );
             if ( at == std::string::npos )
-                at = str.size();
-            if ( at > start )
-                words.push_back( str.substr( start, at - start ) );
+            {
+                words.push_back( str.substr( start ) );
+                break;
+            }
+            words.push_back( str.substr( start, at - start ) );
             start = at + 1;
         }
         return words;
