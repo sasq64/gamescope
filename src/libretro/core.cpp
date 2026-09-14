@@ -18,9 +18,14 @@
 #include "gamescope_libretro_ipc.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -594,8 +599,146 @@ void StopWineServer()
     waitpid( nPid, nullptr, 0 );
 }
 
+// ---------------------------------------------------------------------------
+// Pausing: the frontend pauses by not calling retro_run, so the session is stopped
+// with SIGSTOP after 100ms without one and continued on the next retro_run.
+// ---------------------------------------------------------------------------
+
+struct Pauser
+{
+    std::mutex mutex;
+    std::condition_variable cond;
+    std::thread thread;
+    std::chrono::steady_clock::time_point lastRun;
+    pid_t nGroup = -1;
+    bool bPaused = false;
+    bool bQuit = false;
+} g_Pauser;
+
+// wine setsid()s every process it starts, so signalling the group misses them; take
+// everything in the group and every descendant of it instead.
+void SignalSession( pid_t nGroup, int nSignal )
+{
+    struct Proc { pid_t pid, ppid, pgid; };
+    std::vector<Proc> procs;
+
+    if ( DIR *pDir = opendir( "/proc" ) )
+    {
+        while ( dirent *pEnt = readdir( pDir ) )
+        {
+            pid_t pid = atoi( pEnt->d_name );
+            if ( pid <= 0 )
+                continue;
+
+            char szPath[ 64 ], szStat[ 512 ];
+            snprintf( szPath, sizeof( szPath ), "/proc/%d/stat", pid );
+            int fd = open( szPath, O_RDONLY | O_CLOEXEC );
+            if ( fd < 0 )
+                continue;
+            ssize_t n = read( fd, szStat, sizeof( szStat ) - 1 );
+            close( fd );
+            if ( n <= 0 )
+                continue;
+            szStat[ n ] = 0;
+
+            const char *pszEnd = strrchr( szStat, ')' );
+            int ppid, pgid;
+            char chState;
+            if ( pszEnd && sscanf( pszEnd + 1, " %c %d %d", &chState, &ppid, &pgid ) == 3 )
+                procs.push_back( { pid, ppid, pgid } );
+        }
+        closedir( pDir );
+    }
+
+    std::vector<pid_t> tree;
+    for ( const Proc &proc : procs )
+    {
+        if ( proc.pgid == nGroup )
+            tree.push_back( proc.pid );
+    }
+
+    for ( size_t i = 0; i < tree.size(); i++ )
+    {
+        for ( const Proc &proc : procs )
+        {
+            if ( proc.ppid == tree[i] && std::find( tree.begin(), tree.end(), proc.pid ) == tree.end() )
+                tree.push_back( proc.pid );
+        }
+    }
+
+    for ( pid_t pid : tree )
+        kill( pid, nSignal );
+}
+
+void PauseWatchdog()
+{
+    std::unique_lock<std::mutex> lock( g_Pauser.mutex );
+    while ( !g_Pauser.bQuit )
+    {
+        if ( g_Pauser.bPaused )
+        {
+            g_Pauser.cond.wait( lock );
+            continue;
+        }
+
+        auto deadline = g_Pauser.lastRun + std::chrono::milliseconds( 100 );
+        if ( std::chrono::steady_clock::now() >= deadline )
+        {
+            SignalSession( g_Pauser.nGroup, SIGSTOP );
+            g_Pauser.bPaused = true;
+        }
+        else
+        {
+            g_Pauser.cond.wait_until( lock, deadline );
+        }
+    }
+}
+
+void StartPauseWatchdog()
+{
+    g_Pauser.nGroup = g_Session.nChild;
+    g_Pauser.lastRun = std::chrono::steady_clock::now();
+    g_Pauser.bPaused = false;
+    g_Pauser.bQuit = false;
+    g_Pauser.thread = std::thread( PauseWatchdog );
+}
+
+void StopPauseWatchdog()
+{
+    if ( !g_Pauser.thread.joinable() )
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock( g_Pauser.mutex );
+        g_Pauser.bQuit = true;
+        if ( g_Pauser.bPaused )
+            SignalSession( g_Pauser.nGroup, SIGCONT );
+        g_Pauser.bPaused = false;
+    }
+    g_Pauser.cond.notify_one();
+    g_Pauser.thread.join();
+}
+
+void MarkRun()
+{
+    if ( !g_Pauser.thread.joinable() )
+        return;
+
+    std::lock_guard<std::mutex> lock( g_Pauser.mutex );
+    g_Pauser.lastRun = std::chrono::steady_clock::now();
+    if ( g_Pauser.bPaused )
+    {
+        SignalSession( g_Pauser.nGroup, SIGCONT );
+        g_Pauser.bPaused = false;
+        g_Pauser.cond.notify_one();
+    }
+}
+
 void CloseSession()
 {
+    // A stopped group would sit on the SIGTERM below, and wineserver -k needs it running.
+    StopPauseWatchdog();
+
     if ( g_Session.nSocket >= 0 )
     {
         shutdown( g_Session.nSocket, SHUT_RDWR );
@@ -1211,6 +1354,8 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
     g_Session.bRunning = true;
     g_Session.bReportedExit = false;
 
+    StartPauseWatchdog();
+
     return true;
 }
 
@@ -1226,6 +1371,8 @@ RETRO_API void retro_unload_game( void )
 
 RETRO_API void retro_run( void )
 {
+    MarkRun();
+
     if ( !g_Session.bRunning )
     {
         // Nothing to show and nothing coming. Repeat the last frame so the view holds
