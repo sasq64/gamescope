@@ -79,33 +79,11 @@ void log_line( retro_log_level level, const char *fmt, ... )
 const retro_variable k_Variables[] = {
     { "gamescope_resolution", "Resolution; 800x600|640x480|960x720|1024x768|1280x720|1280x1024|1920x1080" },
     { "gamescope_refresh",    "Refresh rate (Hz); 60|50|30|72|75|100|120" },
-    // Free-form on purpose: the announced list is only what a picker would show, and a
-    // value the frontend already holds (demarc's -x gamescope_command=...) beats it.
     { "gamescope_command",    "Command to run; |wine|chrome" },
-    // No wine_desktop option: a virtual desktop is `explorer /desktop=` in front of the
-    // command, and the command is the frontend's to build -- demarc's capture_meta()
-    // puts it there. An option here would be a second way to say it that this end could
-    // only honour by rewriting somebody else's argv.
     { "gamescope_expose_wayland", "Give the client gamescope's Wayland socket; false|true" },
-    // No sensible list to offer, so the announced default is empty and the value
-    // comes from the frontend. demarc points it at the same prefix wine_emu uses.
     { "gamescope_wineprefix", "WINEPREFIX for a wine client; " },
-    // Same again: wine's own syntax ("d3dx9_37=n"), passed through unread. demarc fills
-    // it in from the DLLs a release ships beside its .exe -- see wine_dll_overrides in
-    // src/newsys/windows.rs.
     { "gamescope_wine_dll_overrides", "WINEDLLOVERRIDES for a wine client; " },
-    // MESA_GL_VERSION_OVERRIDE for the client, passed through unread. The value that
-    // matters is "4.6COMPAT": wine's wglGetProcAddress only hands back the legacy
-    // ARB/EXT aliases (glActiveTextureARB and friends) when the current context
-    // advertises the extension they belong to, which a core-profile context does not,
-    // and a GL demo that resolves its entry points without checking them calls the
-    // resulting NULL. Asking Mesa for a compatibility profile puts the strings back.
-    // demarc's capture_meta() sets it from wine_gl_compat -- see src/newsys/windows.rs.
     { "gamescope_mesa_gl_version_override", "MESA_GL_VERSION_OVERRIDE for the client; " },
-    // Whether teardown ends wine in the prefix -- see StopWineServer. True on its own,
-    // because a core left to itself is the only thing that can. A frontend running
-    // several sessions in one prefix sets this false and closes the prefix itself once
-    // the last of them has gone; demarc's capture_meta() does exactly that.
     { "gamescope_close_prefix", "Shut the WINEPREFIX down on unload; true|false" },
     { nullptr, nullptr },
 };
@@ -561,8 +539,9 @@ Client BuildClient( const std::string &strPath )
 // so two wine sessions sharing one prefix cannot be closed independently. Which is why
 // the frontend can take it over: `gamescope_close_prefix=false` leaves strWinePrefix
 // empty and this a no-op, and demarc -- who is the only one that knows how many sessions
-// it has in there -- closes the prefix once the last of them is gone. See PrefixGuard in
-// src/wine_emu.rs.
+// it has in there -- decides what closing means. Today it says false for every sandboxed
+// session, because a sandboxed prefix has nothing to close; see SpawnCompositor below
+// and src/wine_sandbox.rs in demarc's tree.
 void StopWineServer()
 {
     if ( g_Session.strWinePrefix.empty() )
@@ -863,14 +842,34 @@ bool SpawnCompositor( const Client &client )
     if ( !strPrefix.empty() )
     {
         childEnv.emplace_back( "WINEPREFIX", strPrefix );
+
         // Recording it is what arms StopWineServer, so a frontend that owns the prefix's
         // lifetime turns teardown off simply by not letting it be recorded.
         const bool bClosePrefix = GetOption( "gamescope_close_prefix", "true" ) != "false";
-        if ( bClosePrefix && !client.argv.empty() && client.argv[0] == "wine" )
+
+        // Two things have to be true before `wineserver -k` is worth running: the
+        // frontend has to want it, and the prefix has to be one this process can
+        // reach. Only a client we start as wine ourselves is.
+        //
+        // A sandboxed session is not. demarc sends those as `bwrap ... -- wine ...`
+        // (src/wine_sandbox.rs), where the prefix is a throwaway overlay living in the
+        // sandbox's own mount namespace and wineserver's socket in the sandbox's own
+        // /tmp -- so there is nothing out here to talk to, and the path in strPrefix
+        // names an empty directory. Nor is there anything to close: the sandbox is a
+        // pid namespace, and every wine process in it goes when the demo does, which is
+        // the whole reason it exists. demarc says `gamescope_close_prefix=false` for
+        // those as well; this is the half that does not depend on it remembering.
+        const bool bDirectWine = !client.argv.empty() && client.argv[0] == "wine";
+        const bool bSandboxed  = !client.argv.empty() && client.argv[0] == "bwrap";
+
+        if ( bClosePrefix && bDirectWine )
             g_Session.strWinePrefix = strPrefix;
-        else if ( !bClosePrefix )
-            log_line( RETRO_LOG_INFO, "Leaving the wine prefix %s to the frontend to close",
-                      strPrefix.c_str() );
+        else
+            log_line( RETRO_LOG_INFO, "Not closing the wine prefix %s on unload: %s",
+                      strPrefix.c_str(),
+                      !bClosePrefix ? "the frontend owns it"
+                                    : bSandboxed ? "the client is sandboxed"
+                                                 : "the client is not wine" );
     }
 
     std::string strDllOverrides = GetOption( "gamescope_wine_dll_overrides", "" );
