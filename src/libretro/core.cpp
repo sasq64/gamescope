@@ -84,6 +84,8 @@ const retro_variable k_Variables[] = {
     { "gamescope_wineprefix", "WINEPREFIX for a wine client; " },
     { "gamescope_wine_dll_overrides", "WINEDLLOVERRIDES for a wine client; " },
     { "gamescope_mesa_gl_version_override", "MESA_GL_VERSION_OVERRIDE for the client; " },
+    { "gamescope_mesa_glsl_version", "force_glsl_version for the client; " },
+    { "gamescope_mesa_allow_glsl_120_subset_in_110", "allow_glsl_120_subset_in_110 for the client; false|true" },
     { "gamescope_close_prefix", "Shut the WINEPREFIX down on unload; true|false" },
     { nullptr, nullptr },
 };
@@ -886,6 +888,20 @@ bool SpawnCompositor( const Client &client )
     {
         childEnv.emplace_back( "MESA_GL_VERSION_OVERRIDE", strGlVersion );
         log_line( RETRO_LOG_INFO, "MESA_GL_VERSION_OVERRIDE=%s", strGlVersion.c_str() );
+    }
+
+    // Client only: forced on Xwayland it also rewrites glamor's own shaders.
+    std::string strGlslVersion = GetOption( "gamescope_mesa_glsl_version", "" );
+    if ( !strGlslVersion.empty() )
+    {
+        childEnv.emplace_back( "force_glsl_version", strGlslVersion );
+        log_line( RETRO_LOG_INFO, "force_glsl_version=%s", strGlslVersion.c_str() );
+    }
+
+    if ( GetOption( "gamescope_mesa_allow_glsl_120_subset_in_110", "false" ) == "true" )
+    {
+        childEnv.emplace_back( "allow_glsl_120_subset_in_110", "true" );
+        log_line( RETRO_LOG_INFO, "allow_glsl_120_subset_in_110=true" );
     }
 
     // wine is loud enough on its own to fill a pipe. The frontend can turn it back
