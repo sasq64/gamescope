@@ -202,6 +202,15 @@ struct Session
     // Set when the client was wine, so teardown knows to shut the prefix down.
     std::string strWinePrefix;
 
+    // The client's stdout, and whatever of the current line has arrived on it.
+    int nClientOut = -1;
+    std::string strClientLine;
+
+    // Black instead of the session, while the dialog driver says so.
+    bool bHiding = false;
+    unsigned uHideTicks = 0;
+    std::vector<uint32_t> Black;
+
     // Frames of silence owed to the frontend, and the pointer state we last sent.
     std::vector<int16_t> Silence;
     int16_t  nLastMouseButtons = 0;
@@ -777,6 +786,15 @@ void CloseSession()
         buffer = Buffer{};
     }
 
+    if ( g_Session.nClientOut >= 0 )
+    {
+        close( g_Session.nClientOut );
+        g_Session.nClientOut = -1;
+    }
+    g_Session.strClientLine.clear();
+    g_Session.bHiding = false;
+    g_Session.uHideTicks = 0;
+
     g_Session.uNumBuffers = 0;
     g_Session.nLastSlot = -1;
     g_Session.bRunning = false;
@@ -790,6 +808,18 @@ bool SpawnCompositor( const Client &client )
     {
         log_line( RETRO_LOG_ERROR, "socketpair failed: %s", strerror( errno ) );
         return false;
+    }
+
+    // The client's stdout comes back through a pipe rather than straight to ours: the
+    // dialog driver reports what the demo is doing on it -- see tools/autodlg in
+    // demarc's tree -- and nothing in here could read those lines otherwise. Everything
+    // read is written on to our own stdout, so a client that just logs is unaffected.
+    int out[ 2 ] = { -1, -1 };
+    if ( pipe2( out, O_CLOEXEC ) != 0 )
+    {
+        log_line( RETRO_LOG_WARN, "pipe failed, the client's output is not readable: %s",
+                  strerror( errno ) );
+        out[0] = out[1] = -1;
     }
 
     std::string strBin = FindGamescope();
@@ -915,6 +945,11 @@ bool SpawnCompositor( const Client &client )
         log_line( RETRO_LOG_ERROR, "fork failed: %s", strerror( errno ) );
         close( sv[0] );
         close( sv[1] );
+        if ( out[0] >= 0 )
+        {
+            close( out[0] );
+            close( out[1] );
+        }
         return false;
     }
 
@@ -927,6 +962,13 @@ bool SpawnCompositor( const Client &client )
             _exit( 127 );
         if ( sv[1] != k_nChildFd )
             close( sv[1] );
+
+        if ( out[1] >= 0 )
+        {
+            close( out[0] );
+            dup2( out[1], STDOUT_FILENO );
+            close( out[1] );
+        }
 
         // Its own session, so killing the group takes the whole tree; and if the
         // frontend dies without unloading us, the kernel cleans up.
@@ -944,6 +986,13 @@ bool SpawnCompositor( const Client &client )
     }
 
     close( sv[1] );
+
+    if ( out[1] >= 0 )
+    {
+        close( out[1] );
+        fcntl( out[0], F_SETFL, O_NONBLOCK );
+        g_Session.nClientOut = out[0];
+    }
 
     g_Session.nSocket = sv[0];
     g_Session.nChild = nPid;
@@ -1094,6 +1143,13 @@ void DmaSync( const Buffer &buffer, uint64_t uFlags )
     } while ( ret < 0 && errno == EINTR );
 }
 
+void ReleaseSlot( int nSlot )
+{
+    gslr_release release = {};
+    release.slot = uint32_t( nSlot );
+    SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
+}
+
 void PublishFrame( int nSlot )
 {
     const Buffer &buffer = g_Session.Buffers[ nSlot ];
@@ -1105,9 +1161,17 @@ void PublishFrame( int nSlot )
     DmaSync( buffer, DMA_BUF_SYNC_END );
 
     // The frontend copied the pixels inside video_refresh, so the slot is free again.
-    gslr_release release = {};
-    release.slot = uint32_t( nSlot );
-    SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
+    ReleaseSlot( nSlot );
+}
+
+void PublishBlack()
+{
+    size_t uPixels = size_t( g_Session.uWidth ) * g_Session.uHeight;
+    if ( g_Session.Black.size() != uPixels )
+        g_Session.Black.assign( uPixels, 0 );
+
+    video_cb( g_Session.Black.data(), g_Session.uWidth, g_Session.uHeight,
+              g_Session.uWidth * 4 );
 }
 
 // A client that changes mode changes how much of the session it covers, which is the
@@ -1184,11 +1248,7 @@ int DrainFrames()
         {
             // Give back the frame we are about to skip over rather than hold two.
             if ( nNewest >= 0 )
-            {
-                gslr_release release = {};
-                release.slot = uint32_t( nNewest );
-                SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
-            }
+                ReleaseSlot( nNewest );
             nNewest = int( msg.frame.slot );
             uUsedWidth = msg.frame.used_width;
             uUsedHeight = msg.frame.used_height;
@@ -1207,6 +1267,78 @@ int DrainFrames()
         SetUsedSize( uUsedWidth, uUsedHeight );
 
     return nNewest;
+}
+
+// The dialog driver's own line prefix -- see `report` in tools/autodlg.
+const char k_szSentinel[] = "!demarc ";
+
+// The setup dialog is not part of the demo, and under `-f` gamescope blows it up to
+// fill the session. The driver says when it is up and when the demo's window has
+// replaced it; between the two the frontend gets black.
+void OnClientEvent( const std::string &strEvent )
+{
+    if ( strEvent == "hiding" )
+    {
+        g_Session.bHiding = true;
+        g_Session.uHideTicks = 0;
+    }
+    else if ( strEvent == "visible" || strEvent == "exited" || strEvent == "failed" )
+    {
+        g_Session.bHiding = false;
+    }
+}
+
+// Read whatever the client has written, pass it on to our own stdout, and act on the
+// driver's lines. Non-blocking: a tick that finds nothing costs one read.
+void PumpClientOutput()
+{
+    for ( ;; )
+    {
+        if ( g_Session.nClientOut < 0 )
+            return;
+
+        char szBuf[ 4096 ];
+        ssize_t got = read( g_Session.nClientOut, szBuf, sizeof( szBuf ) );
+
+        if ( got < 0 && errno == EINTR )
+            continue;
+
+        if ( got < 0 )
+            return;
+
+        if ( got == 0 )
+        {
+            // Every writer has gone; there is nobody left to say "visible".
+            close( g_Session.nClientOut );
+            g_Session.nClientOut = -1;
+            g_Session.bHiding = false;
+            return;
+        }
+
+        (void)!write( STDOUT_FILENO, szBuf, size_t( got ) );
+
+        g_Session.strClientLine.append( szBuf, size_t( got ) );
+
+        for ( ;; )
+        {
+            size_t uEol = g_Session.strClientLine.find( '\n' );
+            if ( uEol == std::string::npos )
+                break;
+
+            std::string strLine = g_Session.strClientLine.substr( 0, uEol );
+            g_Session.strClientLine.erase( 0, uEol + 1 );
+
+            while ( !strLine.empty() && isspace( (unsigned char)strLine.back() ) )
+                strLine.pop_back();
+
+            if ( strLine.compare( 0, sizeof( k_szSentinel ) - 1, k_szSentinel ) == 0 )
+                OnClientEvent( strLine.substr( sizeof( k_szSentinel ) - 1 ) );
+        }
+
+        // A client that writes megabytes without a newline is not saying anything.
+        if ( g_Session.strClientLine.size() > 64 * 1024 )
+            g_Session.strClientLine.clear();
+    }
 }
 
 void PumpInput()
@@ -1368,6 +1500,8 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
 
     g_Session.bRunning = true;
     g_Session.bReportedExit = false;
+    g_Session.bHiding = false;
+    g_Session.uHideTicks = 0;
 
     StartPauseWatchdog();
 
@@ -1398,11 +1532,28 @@ RETRO_API void retro_run( void )
         return;
     }
 
+    PumpClientOutput();
     PumpInput();
 
     int nSlot = DrainFrames();
 
-    if ( nSlot >= 0 )
+    // A driver that dies between its two lines must not leave the view black for
+    // good, so hiding gives up on its own after a few seconds.
+    if ( g_Session.bHiding && ++g_Session.uHideTicks > unsigned( g_Session.flFps * 10.0 ) )
+    {
+        log_line( RETRO_LOG_WARN, "the dialog driver never said the demo was up" );
+        g_Session.bHiding = false;
+    }
+
+    if ( g_Session.bHiding )
+    {
+        // Drained and given back all the same: holding the slots would stall the
+        // compositor, and the frame behind the dialog is of no use to anyone.
+        if ( nSlot >= 0 )
+            ReleaseSlot( nSlot );
+        PublishBlack();
+    }
+    else if ( nSlot >= 0 )
     {
         PublishFrame( nSlot );
         g_Session.nLastSlot = nSlot;
