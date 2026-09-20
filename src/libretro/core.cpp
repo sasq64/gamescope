@@ -44,6 +44,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if HAVE_PIPEWIRE_AUDIO
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -87,6 +92,7 @@ const retro_variable k_Variables[] = {
     { "gamescope_mesa_glsl_version", "force_glsl_version for the client; " },
     { "gamescope_mesa_allow_glsl_120_subset_in_110", "allow_glsl_120_subset_in_110 for the client; false|true" },
     { "gamescope_close_prefix", "Shut the WINEPREFIX down on unload; true|false" },
+    { "gamescope_audio", "Capture the client's audio instead of letting it play to the desktop; true|false" },
     { nullptr, nullptr },
 };
 
@@ -211,8 +217,8 @@ struct Session
     unsigned uHideTicks = 0;
     std::vector<uint32_t> Black;
 
-    // Frames of silence owed to the frontend, and the pointer state we last sent.
-    std::vector<int16_t> Silence;
+    // The buffer PublishAudio hands the frontend, and the pointer state we last sent.
+    std::vector<int16_t> Audio;
     int16_t  nLastMouseButtons = 0;
 } g_Session;
 
@@ -590,6 +596,369 @@ void StopWineServer()
 }
 
 // ---------------------------------------------------------------------------
+// Audio
+//
+// gamescope has none, and a client left to itself plays to whatever sink the desktop
+// points at -- past every volume control the frontend has, and in a grid that is every
+// demo at once. So the session gets a sink of its own: a PipeWire stream declaring
+// media.class=Audio/Sink, which is all it takes to be a sink in the graph, with the
+// client's PULSE_SINK aimed at it. What the client writes there arrives in OnProcess,
+// and retro_run hands it over like any other core's audio.
+//
+// libpipewire is dlopen'd rather than linked, so the core still needs nothing but libc
+// and libstdc++, and a machine without PipeWire loses the sound rather than the
+// session. PULSE_SINK is read by libpulse on the client's side, which is why it works
+// against pipewire-pulse and PulseAudio alike, and why a client using wine's ALSA
+// driver instead ignores it and still reaches the speakers.
+// ---------------------------------------------------------------------------
+
+// How much the ring may hold before it starts dropping its oldest samples. Also what
+// bounds the stale audio a SIGSTOP pause leaves behind.
+const size_t k_uAudioLatencyMs = 120;
+
+// What retro_get_system_av_info reports, so the two have to agree.
+const size_t k_uAudioRate = 48000;
+
+#if HAVE_PIPEWIRE_AUDIO
+
+struct PwApi
+{
+    void *pHandle = nullptr;
+
+    void            (*init)( int *, char *** );
+    void            (*deinit)( void );
+    pw_thread_loop *(*thread_loop_new)( const char *, const spa_dict * );
+    void            (*thread_loop_destroy)( pw_thread_loop * );
+    int             (*thread_loop_start)( pw_thread_loop * );
+    void            (*thread_loop_stop)( pw_thread_loop * );
+    pw_loop        *(*thread_loop_get_loop)( pw_thread_loop * );
+    pw_context     *(*context_new)( pw_loop *, pw_properties *, size_t );
+    void            (*context_destroy)( pw_context * );
+    pw_core        *(*context_connect)( pw_context *, pw_properties *, size_t );
+    int             (*core_disconnect)( pw_core * );
+    pw_properties  *(*properties_new)( const char *, ... );
+    pw_stream      *(*stream_new)( pw_core *, const char *, pw_properties * );
+    void            (*stream_add_listener)( pw_stream *, spa_hook *, const pw_stream_events *, void * );
+    int             (*stream_connect)( pw_stream *, spa_direction, uint32_t, pw_stream_flags, const spa_pod **, uint32_t );
+    pw_buffer      *(*stream_dequeue_buffer)( pw_stream * );
+    int             (*stream_queue_buffer)( pw_stream *, pw_buffer * );
+    void            (*stream_destroy)( pw_stream * );
+
+    bool Load()
+    {
+        if ( pHandle )
+            return true;
+
+        pHandle = dlopen( "libpipewire-0.3.so.0", RTLD_LAZY | RTLD_LOCAL );
+        if ( !pHandle )
+        {
+            log_line( RETRO_LOG_INFO, "no libpipewire: %s", dlerror() );
+            return false;
+        }
+
+        bool bOk = true;
+        auto Sym = [&]( const char *pszName ) -> void *
+        {
+            void *pSym = dlsym( pHandle, pszName );
+            if ( !pSym )
+            {
+                log_line( RETRO_LOG_WARN, "libpipewire has no %s", pszName );
+                bOk = false;
+            }
+            return pSym;
+        };
+
+#define GSLR_SYM( member ) member = ( decltype( member ) )Sym( "pw_" #member )
+        GSLR_SYM( init );
+        GSLR_SYM( deinit );
+        GSLR_SYM( thread_loop_new );
+        GSLR_SYM( thread_loop_destroy );
+        GSLR_SYM( thread_loop_start );
+        GSLR_SYM( thread_loop_stop );
+        GSLR_SYM( thread_loop_get_loop );
+        GSLR_SYM( context_new );
+        GSLR_SYM( context_destroy );
+        GSLR_SYM( context_connect );
+        GSLR_SYM( core_disconnect );
+        GSLR_SYM( properties_new );
+        GSLR_SYM( stream_new );
+        GSLR_SYM( stream_add_listener );
+        GSLR_SYM( stream_connect );
+        GSLR_SYM( stream_dequeue_buffer );
+        GSLR_SYM( stream_queue_buffer );
+        GSLR_SYM( stream_destroy );
+#undef GSLR_SYM
+
+        if ( !bOk )
+        {
+            // Nothing of it has run yet, so it can go back where it came from.
+            dlclose( pHandle );
+            pHandle = nullptr;
+        }
+
+        return bOk;
+    }
+};
+
+struct AudioCapture
+{
+    PwApi Api;
+
+    pw_thread_loop *pLoop = nullptr;
+    pw_context     *pContext = nullptr;
+    pw_core        *pCore = nullptr;
+    pw_stream      *pStream = nullptr;
+    spa_hook        Hook{};
+    bool            bInited = false;
+
+    // Written by the PipeWire data thread, read by retro_run.
+    std::mutex           mutex;
+    std::vector<int16_t> Ring;
+    size_t               uCap = 0;
+
+    std::string strSink;
+
+    bool Active() const { return pStream != nullptr; }
+    const char *SinkName() const { return strSink.c_str(); }
+
+    void OnProcess()
+    {
+        pw_buffer *pBuf = Api.stream_dequeue_buffer( pStream );
+        if ( !pBuf )
+            return;
+
+        const spa_data &data = pBuf->buffer->datas[ 0 ];
+        if ( data.data && data.chunk && data.chunk->size )
+        {
+            const int16_t *pSamples = (const int16_t *)( (const uint8_t *)data.data + data.chunk->offset );
+            const size_t uCount = data.chunk->size / sizeof( int16_t );
+
+            std::lock_guard<std::mutex> lock( mutex );
+
+            // Reserved to uCap in Start(), and never grown past it, so none of this
+            // allocates on the data thread.
+            if ( uCount >= uCap )
+            {
+                Ring.assign( pSamples + uCount - uCap, pSamples + uCount );
+            }
+            else
+            {
+                if ( Ring.size() + uCount > uCap )
+                    Ring.erase( Ring.begin(), Ring.begin() + ( Ring.size() + uCount - uCap ) );
+                Ring.insert( Ring.end(), pSamples, pSamples + uCount );
+            }
+        }
+
+        Api.stream_queue_buffer( pStream, pBuf );
+    }
+
+    size_t Take( int16_t *pOut, size_t uWant )
+    {
+        std::lock_guard<std::mutex> lock( mutex );
+
+        const size_t uGot = std::min( uWant, Ring.size() );
+        memcpy( pOut, Ring.data(), uGot * sizeof( int16_t ) );
+        Ring.erase( Ring.begin(), Ring.begin() + uGot );
+        return uGot;
+    }
+
+    bool Connect();
+
+    bool Start()
+    {
+        if ( pStream )
+            return true;
+
+        if ( !Api.Load() )
+            return false;
+
+        // Unique per session: two sessions in one frontend are two copies of this
+        // library with separate globals, so a counter would start at zero in both.
+        const uint64_t uNow = uint64_t( std::chrono::steady_clock::now().time_since_epoch().count() );
+        char szName[ 64 ];
+        snprintf( szName, sizeof( szName ), "demarc-%d-%06x", int( getpid() ), unsigned( uNow & 0xffffff ) );
+        strSink = szName;
+
+        uCap = k_uAudioRate * 2 * k_uAudioLatencyMs / 1000;
+        Ring.clear();
+        Ring.reserve( uCap );
+
+        Api.init( nullptr, nullptr );
+        bInited = true;
+
+        if ( !Connect() )
+        {
+            Stop();
+            return false;
+        }
+
+        log_line( RETRO_LOG_INFO, "capturing the session's audio from sink %s", strSink.c_str() );
+        return true;
+    }
+
+    void Stop()
+    {
+        if ( pLoop )
+            Api.thread_loop_stop( pLoop );
+
+        if ( pStream )
+        {
+            Api.stream_destroy( pStream );
+            pStream = nullptr;
+        }
+        if ( pCore )
+        {
+            Api.core_disconnect( pCore );
+            pCore = nullptr;
+        }
+        // Takes the null sink module with it.
+        if ( pContext )
+        {
+            Api.context_destroy( pContext );
+            pContext = nullptr;
+        }
+        if ( pLoop )
+        {
+            Api.thread_loop_destroy( pLoop );
+            pLoop = nullptr;
+        }
+        if ( bInited )
+        {
+            Api.deinit();
+            bInited = false;
+        }
+
+        std::lock_guard<std::mutex> lock( mutex );
+        Ring.clear();
+        strSink.clear();
+    }
+};
+
+AudioCapture g_Audio;
+
+void OnStreamProcess( void *pUser )
+{
+    ( (AudioCapture *)pUser )->OnProcess();
+}
+
+const pw_stream_events k_StreamEvents = {
+    .version = PW_VERSION_STREAM_EVENTS,
+    .process = OnStreamProcess,
+};
+
+// Everything is built before the loop is started, so none of it needs the loop lock.
+//
+// The sink is the capture stream itself -- a stream that declares media.class=Audio/Sink
+// is a sink in the graph, and what clients write to it arrives in the process callback.
+// So there is no null-sink module to load and no monitor to record, and nothing can
+// outlive the session: `pactl load-module` would leave a sink behind every time one
+// crashed, the same way the wine processes used to be left behind.
+//
+// It also has no autoconnect, which matters more than it looks: a capture stream that
+// autoconnects and cannot find its target falls back to the default sink's monitor,
+// which would quietly record the user's whole desktop.
+bool AudioCapture::Connect()
+{
+    pLoop = Api.thread_loop_new( "demarc-audio", nullptr );
+    if ( !pLoop )
+        return false;
+
+    pContext = Api.context_new( Api.thread_loop_get_loop( pLoop ), nullptr, 0 );
+    if ( !pContext )
+        return false;
+
+    pCore = Api.context_connect( pContext, nullptr, 0 );
+    if ( !pCore )
+    {
+        log_line( RETRO_LOG_INFO, "no PipeWire to connect to" );
+        return false;
+    }
+
+    pw_properties *pProps = Api.properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CLASS, "Audio/Sink",
+        PW_KEY_NODE_NAME, strSink.c_str(),
+        PW_KEY_NODE_DESCRIPTION, "demarc",
+        // Last in line, so the session manager never makes the session's sink the
+        // desktop's default and points somebody else's audio into a demo.
+        PW_KEY_PRIORITY_SESSION, "0",
+        nullptr );
+
+    pStream = Api.stream_new( pCore, strSink.c_str(), pProps );
+    if ( !pStream )
+        return false;
+
+    Api.stream_add_listener( pStream, &Hook, &k_StreamEvents, this );
+
+    spa_audio_info_raw info = {};
+    info.format = SPA_AUDIO_FORMAT_S16;
+    info.rate = k_uAudioRate;
+    info.channels = 2;
+    info.position[ 0 ] = SPA_AUDIO_CHANNEL_FL;
+    info.position[ 1 ] = SPA_AUDIO_CHANNEL_FR;
+
+    uint8_t podBuf[ 1024 ];
+    spa_pod_builder builder = SPA_POD_BUILDER_INIT( podBuf, sizeof( podBuf ) );
+    const spa_pod *pParams[ 1 ] = { spa_format_audio_raw_build( &builder, SPA_PARAM_EnumFormat, &info ) };
+
+    if ( Api.stream_connect( pStream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                             pw_stream_flags( PW_STREAM_FLAG_MAP_BUFFERS |
+                                              PW_STREAM_FLAG_RT_PROCESS ),
+                             pParams, 1 ) < 0 )
+    {
+        log_line( RETRO_LOG_WARN, "could not create the session's sink" );
+        return false;
+    }
+
+    if ( Api.thread_loop_start( pLoop ) < 0 )
+        return false;
+
+    return true;
+}
+
+#else // HAVE_PIPEWIRE_AUDIO
+
+// Built without the PipeWire headers. The session plays to the desktop's sink, as it
+// did before any of this.
+struct AudioCapture
+{
+    bool Active() const { return false; }
+    const char *SinkName() const { return ""; }
+    bool Start() { return false; }
+    void Stop() {}
+    size_t Take( int16_t *, size_t ) { return 0; }
+};
+
+AudioCapture g_Audio;
+
+#endif // HAVE_PIPEWIRE_AUDIO
+
+// One tick's worth of samples, whatever the capture managed to supply.
+//
+// The count is what matters, not the content: the frontend runs on an audio clock, so
+// handing it less than a video frame's worth makes it call retro_run again to refill,
+// and handing it more makes it skip a call -- which here costs a video frame. So always
+// exactly nominal, padded with silence when the client is quiet or there is no capture
+// at all, and the ring drops its oldest samples rather than let a backlog build.
+void PublishAudio()
+{
+    if ( !audio_batch_cb )
+        return;
+
+    const double flFps = g_Session.flFps > 0.0 ? g_Session.flFps : 60.0;
+    const size_t uFrames = size_t( double( k_uAudioRate ) / flFps );
+
+    if ( g_Session.Audio.size() != uFrames * 2 )
+        g_Session.Audio.assign( uFrames * 2, 0 );
+
+    const size_t uGot = g_Audio.Take( g_Session.Audio.data(), g_Session.Audio.size() );
+    if ( uGot < g_Session.Audio.size() )
+        memset( g_Session.Audio.data() + uGot, 0, ( g_Session.Audio.size() - uGot ) * sizeof( int16_t ) );
+
+    audio_batch_cb( g_Session.Audio.data(), uFrames );
+}
+
+// ---------------------------------------------------------------------------
 // Pausing: the frontend pauses by not calling retro_run, so the session is stopped
 // with SIGSTOP after 100ms without one and continued on the next retro_run.
 // ---------------------------------------------------------------------------
@@ -795,6 +1164,8 @@ void CloseSession()
     g_Session.bHiding = false;
     g_Session.uHideTicks = 0;
 
+    g_Audio.Stop();
+
     g_Session.uNumBuffers = 0;
     g_Session.nLastSlot = -1;
     g_Session.bRunning = false;
@@ -939,6 +1310,36 @@ bool SpawnCompositor( const Client &client )
     if ( !getenv( "WINEDEBUG" ) )
         childEnv.emplace_back( "WINEDEBUG", "-all" );
 
+    // libpulse reads this and opens the session's own sink instead of the desktop's.
+    if ( g_Audio.Active() )
+        childEnv.emplace_back( "PULSE_SINK", g_Audio.SinkName() );
+
+    // Flattened here rather than setenv'd in the child, because setenv allocates: this
+    // process is threaded -- the frontend's own threads, and now a PipeWire one -- and a
+    // child that allocates can deadlock on an arena lock somebody held at the fork.
+    std::vector<std::string> envStrings;
+    for ( char **ppEnv = environ; ppEnv && *ppEnv; ppEnv++ )
+    {
+        const char *pszEq = strchr( *ppEnv, '=' );
+        if ( !pszEq )
+            continue;
+
+        const std::string strKey( *ppEnv, pszEq - *ppEnv );
+        bool bOverridden = false;
+        for ( const auto &env : childEnv )
+            bOverridden = bOverridden || env.first == strKey;
+
+        if ( !bOverridden )
+            envStrings.push_back( *ppEnv );
+    }
+    for ( const auto &env : childEnv )
+        envStrings.push_back( env.first + "=" + env.second );
+
+    std::vector<char *> envp;
+    for ( std::string &strEnv : envStrings )
+        envp.push_back( const_cast<char *>( strEnv.c_str() ) );
+    envp.push_back( nullptr );
+
     pid_t nPid = fork();
     if ( nPid < 0 )
     {
@@ -975,13 +1376,10 @@ bool SpawnCompositor( const Client &client )
         setsid();
         prctl( PR_SET_PDEATHSIG, SIGKILL );
 
-        for ( const auto &env : childEnv )
-            setenv( env.first.c_str(), env.second.c_str(), 1 );
-
         if ( !client.strWorkDir.empty() )
             (void)chdir( client.strWorkDir.c_str() );
 
-        execvp( argv[0], argv.data() );
+        execvpe( argv[0], argv.data(), envp.data() );
         _exit( 127 );
     }
 
@@ -1478,6 +1876,9 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
         return false;
     }
 
+    if ( GetOption( "gamescope_audio", "true" ) != "false" )
+        g_Audio.Start();
+
     if ( !SpawnCompositor( client ) )
     {
         CloseSession();
@@ -1489,11 +1890,6 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
         CloseSession();
         return false;
     }
-
-    // One frame of silence, so the frontend's audio clock advances even though nothing
-    // in here makes a sound yet. See the audio milestone in docs/GAMESCOPE.md.
-    size_t uFrames = size_t( 48000.0 / g_Session.flFps );
-    g_Session.Silence.assign( uFrames * 2, 0 );
 
     g_Session.uUsedWidth = 0;
     g_Session.uUsedHeight = 0;
@@ -1527,8 +1923,7 @@ RETRO_API void retro_run( void )
         // Nothing to show and nothing coming. Repeat the last frame so the view holds
         // its picture instead of going black the moment the demo exits.
         video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
-        if ( audio_batch_cb && !g_Session.Silence.empty() )
-            audio_batch_cb( g_Session.Silence.data(), g_Session.Silence.size() / 2 );
+        PublishAudio();
         return;
     }
 
@@ -1565,8 +1960,7 @@ RETRO_API void retro_run( void )
         video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
     }
 
-    if ( audio_batch_cb && !g_Session.Silence.empty() )
-        audio_batch_cb( g_Session.Silence.data(), g_Session.Silence.size() / 2 );
+    PublishAudio();
 }
 
 RETRO_API void retro_reset( void )

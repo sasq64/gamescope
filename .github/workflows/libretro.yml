@@ -54,7 +54,8 @@ jobs:
             libxcb-render0-dev libxcb-res0-dev libxcb-xfixes0-dev \
             libinput-dev libseat-dev libudev-dev libdisplay-info-dev libcap-dev \
             libluajit-5.1-dev libdecor-0-dev libvulkan-dev glslang-tools hwdata \
-            xwayland
+            xwayland \
+            libpipewire-0.3-dev
           # Noble's meson is 1.3.2, exactly wlroots' minimum; take a current one
           # rather than sit on the boundary.
           pipx install meson
@@ -102,7 +103,9 @@ jobs:
 
       # Same options as demarc's `just gamescope-core`, plus the backends this release
       # has no use for: it is only ever run headless behind the libretro backend, and
-      # every dependency dropped here is one less library to ship.
+      # every dependency dropped here is one less library to ship. pipewire stays
+      # disabled even though its headers are installed above: the core dlopen's
+      # libpipewire to capture the session's audio, so nothing links against it.
       - name: Build gamescope and the core
         run: |
           set -euo pipefail

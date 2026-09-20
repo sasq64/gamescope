@@ -44,6 +44,15 @@ add_project_arguments(cppc.get_supported_arguments([
 
 pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'))
 librt_dep = cppc.find_library('rt', required : get_option('pipewire'))
+
+# Headers only, and separate from the feature above: the libretro core dlopen's
+# libpipewire to capture its session's audio, so it needs the declarations at compile
+# time and nothing at link time -- which is what lets a host without PipeWire still run
+# a session, and lets the release keep building with -Dpipewire=disabled.
+pipewire_headers_dep = dependency('libpipewire-0.3', required: false)
+if pipewire_headers_dep.found()
+  pipewire_headers_dep = pipewire_headers_dep.partial_dependency(compile_args: true, includes: true)
+endif
 hwdata_dep = dependency('hwdata', required : false)
 
 dep_x11 = dependency('x11')

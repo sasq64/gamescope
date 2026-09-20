@@ -239,8 +239,9 @@ if not libretro_opt.disabled()
     'gamescope_libretro',
     ['libretro/core.cpp'],
     name_prefix: '',
-    dependencies: [thread_dep],
+    dependencies: [thread_dep, pipewire_headers_dep],
     cpp_args: [
+      '-DHAVE_PIPEWIRE_AUDIO=@0@'.format(pipewire_headers_dep.found().to_int()),
       # The core has to find the compositor it forks, and cannot do it by looking
       # beside itself: a frontend may load the library from a private copy (demarc
       # copies every core into a temp dir so two instances get separate globals),
