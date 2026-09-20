@@ -641,7 +641,6 @@ struct PwApi
     void *pHandle = nullptr;
 
     void            (*init)( int *, char *** );
-    void            (*deinit)( void );
     pw_thread_loop *(*thread_loop_new)( const char *, const spa_dict * );
     void            (*thread_loop_destroy)( pw_thread_loop * );
     int             (*thread_loop_start)( pw_thread_loop * );
@@ -685,7 +684,6 @@ struct PwApi
 
 #define GSLR_SYM( member ) member = ( decltype( member ) )Sym( "pw_" #member )
         GSLR_SYM( init );
-        GSLR_SYM( deinit );
         GSLR_SYM( thread_loop_new );
         GSLR_SYM( thread_loop_destroy );
         GSLR_SYM( thread_loop_start );
@@ -724,7 +722,6 @@ struct AudioCapture
     pw_core        *pCore = nullptr;
     pw_stream      *pStream = nullptr;
     spa_hook        Hook{};
-    bool            bInited = false;
 
     // Written by the PipeWire data thread, read by retro_run.
     std::mutex           mutex;
@@ -798,8 +795,17 @@ struct AudioCapture
         Ring.clear();
         Ring.reserve( uCap );
 
-        Api.init( nullptr, nullptr );
-        bInited = true;
+        // Once per copy of this library and never undone. pw_deinit() would take
+        // libpipewire's global state down with it, and this process has other users of
+        // it -- the frontend's own audio output reaches PipeWire through ALSA, and a
+        // grid has a second session in here -- so the last session to close would
+        // otherwise pull the floor out from under them.
+        static bool s_bInited = false;
+        if ( !s_bInited )
+        {
+            Api.init( nullptr, nullptr );
+            s_bInited = true;
+        }
 
         if ( !Connect() )
         {
@@ -836,11 +842,6 @@ struct AudioCapture
         {
             Api.thread_loop_destroy( pLoop );
             pLoop = nullptr;
-        }
-        if ( bInited )
-        {
-            Api.deinit();
-            bInited = false;
         }
 
         std::lock_guard<std::mutex> lock( mutex );
