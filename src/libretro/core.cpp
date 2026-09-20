@@ -34,7 +34,9 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -291,10 +293,23 @@ std::string LibraryDir()
     return std::string( pszPath, pszSlash - pszPath );
 }
 
+// Absolute, because the child chdir's into the release's directory before it execs. A
+// relative path that was good here -- DEMARC_CORE_DIR=external/gamescope/build-lr/src,
+// say -- resolves to nothing there, and all the frontend gets to see of that is a
+// session that closed the socket before its first frame.
+std::string Absolute( const std::string &strPath )
+{
+    char szReal[ PATH_MAX ];
+    if ( realpath( strPath.c_str(), szReal ) )
+        return szReal;
+
+    return strPath;
+}
+
 std::string FindGamescope()
 {
     if ( const char *pszOverride = getenv( "GAMESCOPE_LIBRETRO_BIN" ) )
-        return pszOverride;
+        return Absolute( pszOverride );
 
     std::vector<std::string> candidates;
 
@@ -310,7 +325,7 @@ std::string FindGamescope()
     for ( const std::string &strCandidate : candidates )
     {
         if ( access( strCandidate.c_str(), X_OK ) == 0 )
-            return strCandidate;
+            return Absolute( strCandidate );
     }
 
     return "gamescope";
