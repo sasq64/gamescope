@@ -2305,12 +2305,21 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 
 	int32_t sourceWidth = window->GetGeometry().nWidth;
 	int32_t sourceHeight = window->GetGeometry().nHeight;
+	int32_t contentX = 0, contentY = 0;
+
+	if ( window->contentRect )
+	{
+		contentX = window->contentRect->nX;
+		contentY = window->contentRect->nY;
+		sourceWidth = window->contentRect->nWidth;
+		sourceHeight = window->contentRect->nHeight;
+	}
 
 	if ( fit )
 	{
 		// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
-		sourceWidth = std::max<int32_t>( sourceWidth, clamp<int>( fit->GetGeometry().nX - window->GetGeometry().nX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
-		sourceHeight = std::max<int32_t>( sourceHeight, clamp<int>( fit->GetGeometry().nY - window->GetGeometry().nY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
+		sourceWidth = std::max<int32_t>( sourceWidth, clamp<int>( fit->GetGeometry().nX - window->GetGeometry().nX - contentX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
+		sourceHeight = std::max<int32_t>( sourceHeight, clamp<int>( fit->GetGeometry().nY - window->GetGeometry().nY - contentY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
 	}
 
 	float cursor_scale = 1.0f;
@@ -2336,8 +2345,8 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	// Compositing ignores the focused window's X11 origin, so the cursor
 	// must also ignore it to stay consistent with the composited output.
 	bool isFocusWindow = (window == m_ctx->focus.focusWindow);
-	int32_t winOriginX = isFocusWindow ? 0 : window->GetGeometry().nX;
-	int32_t winOriginY = isFocusWindow ? 0 : window->GetGeometry().nY;
+	int32_t winOriginX = ( isFocusWindow ? 0 : window->GetGeometry().nX ) + contentX;
+	int32_t winOriginY = ( isFocusWindow ? 0 : window->GetGeometry().nY ) + contentY;
 	scaledX = (winX - winOriginX) * currentScaleRatio_x + cursorOffsetX;
 	scaledY = (winY - winOriginY) * currentScaleRatio_y + cursorOffsetY;
 
@@ -2537,6 +2546,11 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 
 	layer->tex = lastCommit->GetTexture( layer->filter, frameInfo->eUpscaleScaler, layer->colorspace );
 
+	// Where scaleW's content rect starts, in window, texture and commit pixels.
+	int32_t contentX = 0, contentY = 0;
+	int32_t sourceCropX = 0, sourceCropY = 0;
+	int32_t baseCropX = 0, baseCropY = 0;
+
 	if ( flags & PaintWindowFlag::NoScale )
 	{
 		sourceWidth = baseWidth = currentOutputWidth;
@@ -2553,15 +2567,41 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 		// Typically XWayland would do a blit here to avoid that, but when we
 		// are using the bypass layer, we don't get that, so we need to handle
 		// this case explicitly.
+		Rect geometry = scaleW->GetGeometry();
+		bool bContent = scaleW->contentRect && geometry.nWidth > 0 && geometry.nHeight > 0;
+
 		if (w == scaleW) {
 			sourceWidth = layer->tex->width();
 			sourceHeight = layer->tex->height();
 
 			baseWidth = lastCommit->vulkanTex->width();
 			baseHeight = lastCommit->vulkanTex->height();
+
+			if ( bContent )
+			{
+				const Rect &content = *scaleW->contentRect;
+				contentX = content.nX;
+				contentY = content.nY;
+				sourceCropX = content.nX * sourceWidth / geometry.nWidth;
+				sourceCropY = content.nY * sourceHeight / geometry.nHeight;
+				baseCropX = content.nX * baseWidth / geometry.nWidth;
+				baseCropY = content.nY * baseHeight / geometry.nHeight;
+				sourceWidth = content.nWidth * sourceWidth / geometry.nWidth;
+				sourceHeight = content.nHeight * sourceHeight / geometry.nHeight;
+				baseWidth = content.nWidth * baseWidth / geometry.nWidth;
+				baseHeight = content.nHeight * baseHeight / geometry.nHeight;
+			}
 		} else {
-			sourceWidth = scaleW->GetGeometry().nWidth;
-			sourceHeight = scaleW->GetGeometry().nHeight;
+			sourceWidth = geometry.nWidth;
+			sourceHeight = geometry.nHeight;
+
+			if ( bContent )
+			{
+				contentX = scaleW->contentRect->nX;
+				contentY = scaleW->contentRect->nY;
+				sourceWidth = scaleW->contentRect->nWidth;
+				sourceHeight = scaleW->contentRect->nHeight;
+			}
 
 			baseWidth = sourceWidth;
 			baseHeight = sourceHeight;
@@ -2570,8 +2610,8 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 		if ( fit )
 		{
 			// If we have an override window, try to fit it in as long as it won't make our scale go below 1.0.
-			int32_t fitX = fit->GetGeometry().nX - scaleW->GetGeometry().nX;
-			int32_t fitY = fit->GetGeometry().nY - scaleW->GetGeometry().nY;
+			int32_t fitX = fit->GetGeometry().nX - scaleW->GetGeometry().nX - contentX;
+			int32_t fitY = fit->GetGeometry().nY - scaleW->GetGeometry().nY - contentY;
 			sourceWidth = std::max<uint32_t>( sourceWidth, clamp<int>( fitX + fit->GetGeometry().nWidth, 0, currentOutputWidth ) );
 			sourceHeight = std::max<uint32_t>( sourceHeight, clamp<int>( fitY + fit->GetGeometry().nHeight, 0, currentOutputHeight ) );
 
@@ -2581,8 +2621,8 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	}
 
 	// Compositing ignores the base window's origin, so position overrides relative to it.
-	int32_t winOffsetX = w->GetGeometry().nX - scaleW->GetGeometry().nX;
-	int32_t winOffsetY = w->GetGeometry().nY - scaleW->GetGeometry().nY;
+	int32_t winOffsetX = w->GetGeometry().nX - scaleW->GetGeometry().nX - contentX;
+	int32_t winOffsetY = w->GetGeometry().nY - scaleW->GetGeometry().nY - contentY;
 
 	// Some clients position dropdowns slightly outside the output and close them
 	// if the window manager moves them. Leave their X11 geometry alone and clamp
@@ -2593,7 +2633,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 		winOffsetY = std::max( winOffsetY, 0 );
 	}
 
-	bool offset = ( ( winOffsetX || winOffsetY ) && w != scaleW );
+	bool offset = ( ( winOffsetX || winOffsetY ) && w != scaleW ) || sourceCropX || sourceCropY;
 
 	// A pre-emptively upscaled commit draws from an output sized texture, so the
 	// window's own transform comes from the commit dimensions rather than those.
@@ -2610,6 +2650,9 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			baseXOffset += winOffsetX * baseScaleRatio_x;
 			baseYOffset += winOffsetY * baseScaleRatio_y;
 		}
+
+		baseXOffset -= baseCropX * baseScaleRatio_x;
+		baseYOffset -= baseCropY * baseScaleRatio_y;
 
 		if ( zoomScaleRatio != 1.0 )
 		{
@@ -2630,6 +2673,9 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 			drawXOffset += winOffsetX * currentScaleRatio_x;
 			drawYOffset += winOffsetY * currentScaleRatio_y;
 		}
+
+		drawXOffset -= sourceCropX * currentScaleRatio_x;
+		drawYOffset -= sourceCropY * currentScaleRatio_y;
 
 		if ( zoomScaleRatio != 1.0 )
 		{
@@ -5498,6 +5544,65 @@ get_size_hints(xwayland_ctx_t *ctx, steamcompmgr_win_t *w)
 	}
 }
 
+gamescope::ConVar<bool> cv_scale_to_child_window( "scale_to_child_window", true, "Scale a window with exactly one mapped child that is smaller than it to that child." );
+
+static void
+update_content_rect(xwayland_ctx_t *ctx, steamcompmgr_win_t *w)
+{
+	std::optional<Rect> oldRect = w->contentRect;
+	w->contentRect.reset();
+
+	Window root_return = None, parent_return = None;
+	Window *children = NULL;
+	unsigned int nchildren = 0;
+
+	if ( cv_scale_to_child_window &&
+		 XQueryTree( ctx->dpy, w->xwayland().id, &root_return, &parent_return, &children, &nchildren ) )
+	{
+		std::optional<Rect> child;
+		int nMapped = 0;
+		for ( unsigned int i = 0; i < nchildren; i++ )
+		{
+			XWindowAttributes attribs;
+			if ( !XGetWindowAttributes( ctx->dpy, children[i], &attribs ) ||
+				 attribs.c_class != InputOutput || attribs.map_state == IsUnmapped )
+				continue;
+			nMapped++;
+			child = Rect{ attribs.x, attribs.y, attribs.width, attribs.height };
+		}
+
+		Rect geometry = w->GetGeometry();
+		if ( nMapped == 1 && child->nWidth > 0 && child->nHeight > 0 &&
+			 child->nX >= 0 && child->nY >= 0 &&
+			 child->nX + child->nWidth <= geometry.nWidth &&
+			 child->nY + child->nHeight <= geometry.nHeight &&
+			 ( child->nWidth < geometry.nWidth || child->nHeight < geometry.nHeight ) )
+		{
+			w->contentRect = child;
+		}
+	}
+
+	if ( children )
+		XFree( children );
+
+	bool bChanged = oldRect.has_value() != w->contentRect.has_value() ||
+		( oldRect && ( oldRect->nX != w->contentRect->nX || oldRect->nY != w->contentRect->nY ||
+		               oldRect->nWidth != w->contentRect->nWidth || oldRect->nHeight != w->contentRect->nHeight ) );
+	if ( bChanged )
+		MakeFocusDirty();
+}
+
+// A substructure event reports the parent it was selected on as `event`.
+static void
+child_changed(xwayland_ctx_t *ctx, Window parent)
+{
+	if ( parent == ctx->root )
+		return;
+
+	if ( steamcompmgr_win_t *w = find_win( ctx, parent, false ) )
+		update_content_rect( ctx, w );
+}
+
 static void
 get_win_title(xwayland_ctx_t *ctx, steamcompmgr_win_t *w, Atom atom)
 {
@@ -5680,6 +5785,7 @@ map_win(xwayland_ctx_t* ctx, Window id, unsigned long sequence)
 	w->pForwarderPlane = nullptr;
 
 	get_size_hints(ctx, w);
+	update_content_rect(ctx, w);
 
 	get_net_wm_state(ctx, w);
 
@@ -6002,6 +6108,10 @@ configure_win(xwayland_ctx_t *ctx, XConfigureEvent *ce)
 			XDeleteProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeXWaylandModeControl );
 			XFlush( root_ctx->dpy );
 		}
+		else
+		{
+			child_changed(ctx, ce->event);
+		}
 		return;
 	}
 
@@ -6017,6 +6127,7 @@ configure_win(xwayland_ctx_t *ctx, XConfigureEvent *ce)
 	w->xwayland().a.border_width = ce->border_width;
 	w->xwayland().a.override_redirect = ce->override_redirect;
 	restack_win(ctx, w, ce->above);
+	update_content_rect(ctx, w);
 
 	MakeFocusDirty();
 }
@@ -8440,6 +8551,8 @@ void xwayland_ctx_t::Dispatch()
 
 				if (w && w->xwayland().id == ev.xdestroywindow.window)
 					destroy_win(ctx, ev.xdestroywindow.window, true, true);
+				else
+					child_changed(ctx, ev.xdestroywindow.event);
 				break;
 			}
 			case MapNotify:
@@ -8448,6 +8561,8 @@ void xwayland_ctx_t::Dispatch()
 
 				if (w && w->xwayland().id == ev.xmap.window)
 					map_win(ctx, ev.xmap.window, ev.xmap.serial);
+				else
+					child_changed(ctx, ev.xmap.event);
 				break;
 			}
 			case UnmapNotify:
@@ -8456,6 +8571,8 @@ void xwayland_ctx_t::Dispatch()
 
 				if (w && w->xwayland().id == ev.xunmap.window)
 					unmap_win(ctx, ev.xunmap.window, true);
+				else
+					child_changed(ctx, ev.xunmap.event);
 				break;
 			}
 			case FocusOut:
@@ -8518,6 +8635,7 @@ void xwayland_ctx_t::Dispatch()
 						}
 					}
 				}
+				child_changed(ctx, ev.xreparent.event);
 				break;
 			case CirculateNotify:
 				circulate_win(ctx, &ev.xcirculate);

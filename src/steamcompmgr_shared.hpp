@@ -156,6 +156,11 @@ struct steamcompmgr_win_t {
 	bool placed = false;
 	bool ignoreOverrideRedirect = false;
 
+	// The one mapped child of an X11 window when it is smaller than the window,
+	// eg. wine's GL client window under an emulated display mode. Scaled in
+	// place of the whole window.
+	std::optional<Rect> contentRect;
+
 	bool unlockedForFrameCallback = false;
 	bool receivedDoneCommit = false;
 
