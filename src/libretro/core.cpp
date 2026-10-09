@@ -222,6 +222,9 @@ struct Session
     // The buffer PublishAudio hands the frontend, and the pointer state we last sent.
     std::vector<int16_t> Audio;
     int16_t  nLastMouseButtons = 0;
+    int16_t  nLastPointerX = 0;
+    int16_t  nLastPointerY = 0;
+    bool     bLastPointerPressed = false;
 } g_Session;
 
 // A frame's worth of pixels converted into a scratch buffer only when the compositor
@@ -1790,6 +1793,24 @@ void PumpInput()
             else
                 g_Session.nLastMouseButtons &= ~button.bit;
         }
+    }
+
+    // The absolute pointer, which is how demarc scripts a click on a dialog.
+    int16_t nPx = input_state_cb( 0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X );
+    int16_t nPy = input_state_cb( 0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y );
+    bool bPressed = input_state_cb( 0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED ) != 0;
+
+    bool bMoved = nPx != g_Session.nLastPointerX || nPy != g_Session.nLastPointerY;
+    if ( bMoved || bPressed != g_Session.bLastPointerPressed )
+    {
+        if ( bMoved || bPressed )
+            SendInput( GSLR_INPUT_WARP, 0, 0, ( nPx + 0x7fff ) / 65534.0f, ( nPy + 0x7fff ) / 65534.0f );
+        if ( bPressed != g_Session.bLastPointerPressed )
+            SendInput( GSLR_INPUT_BUTTON, BTN_LEFT, bPressed ? 1 : 0, 0.0f, 0.0f );
+
+        g_Session.nLastPointerX = nPx;
+        g_Session.nLastPointerY = nPy;
+        g_Session.bLastPointerPressed = bPressed;
     }
 }
 

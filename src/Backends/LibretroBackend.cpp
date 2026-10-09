@@ -20,6 +20,7 @@
 #include "refresh_rate.h"
 #include "log.hpp"
 #include "main.hpp"
+#include "steamcompmgr.hpp"
 
 #include "../libretro/gamescope_libretro_ipc.h"
 
@@ -581,7 +582,10 @@ namespace gamescope
 
                 case GSLR_INPUT_WARP:
                     wlserver_lock();
-                    wlserver_mousewarp( input.x * g_nOutputWidth, input.y * g_nOutputHeight, uSequence, true );
+                    // Into the focused window's own pixels, as wlserver_touchmotion does.
+                    wlserver_mousewarp( ( input.x * g_nOutputWidth + focusedWindowOffsetX ) * focusedWindowScaleX,
+                                        ( input.y * g_nOutputHeight + focusedWindowOffsetY ) * focusedWindowScaleY,
+                                        uSequence, true );
                     wlserver_unlock();
                     break;
 
