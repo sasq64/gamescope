@@ -540,6 +540,9 @@ Client BuildClient( const std::string &strPath )
             "--disable-session-crashed-bubble",
             // A demo is not a user gesture, and nothing here can click "play".
             "--autoplay-policy=no-user-gesture-required",
+            // A page opened from disk has a null origin, so its XHRs and WebGL
+            // textures are refused without the web server such a release ships.
+            "--allow-file-access-from-files",
         };
         return client;
     }
