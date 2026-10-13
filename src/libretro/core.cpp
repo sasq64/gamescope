@@ -217,6 +217,9 @@ struct Session
     // Black instead of the session, while the dialog driver says so.
     bool bHiding = false;
     unsigned uHideTicks = 0;
+    // The newest frame composited while hiding, shown when hiding ends: a dialog
+    // that never repaints would otherwise stay black.
+    int nHiddenSlot = -1;
     std::vector<uint32_t> Black;
 
     // The buffer PublishAudio hands the frontend, and the pointer state we last sent.
@@ -1190,6 +1193,7 @@ void CloseSession()
 
     g_Session.uNumBuffers = 0;
     g_Session.nLastSlot = -1;
+    g_Session.nHiddenSlot = -1;
     g_Session.bRunning = false;
     g_Session.strWinePrefix.clear();
 }
@@ -1982,11 +1986,24 @@ RETRO_API void retro_run( void )
 
     if ( g_Session.bHiding )
     {
-        // Drained and given back all the same: holding the slots would stall the
-        // compositor, and the frame behind the dialog is of no use to anyone.
+        // Only the newest is kept: holding more would stall the compositor.
         if ( nSlot >= 0 )
-            ReleaseSlot( nSlot );
+        {
+            if ( g_Session.nHiddenSlot >= 0 )
+                ReleaseSlot( g_Session.nHiddenSlot );
+            g_Session.nHiddenSlot = nSlot;
+        }
         PublishBlack();
+    }
+    else if ( g_Session.nHiddenSlot >= 0 )
+    {
+        if ( nSlot >= 0 )
+            ReleaseSlot( g_Session.nHiddenSlot );
+        else
+            nSlot = g_Session.nHiddenSlot;
+        g_Session.nHiddenSlot = -1;
+        PublishFrame( nSlot );
+        g_Session.nLastSlot = nSlot;
     }
     else if ( nSlot >= 0 )
     {
