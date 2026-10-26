@@ -643,6 +643,9 @@ const size_t k_uAudioLatencyMs = 120;
 // What retro_get_system_av_info reports, so the two have to agree.
 const size_t k_uAudioRate = 48000;
 
+// How long without a buffer from the graph before the capture counts as idle.
+const std::chrono::milliseconds k_msAudioIdle( 100 );
+
 #if HAVE_PIPEWIRE_AUDIO
 
 struct PwApi
@@ -736,6 +739,7 @@ struct AudioCapture
     std::mutex           mutex;
     std::vector<int16_t> Ring;
     size_t               uCap = 0;
+    std::chrono::steady_clock::time_point LastProcess{};
 
     std::string strSink;
 
@@ -755,6 +759,7 @@ struct AudioCapture
             const size_t uCount = data.chunk->size / sizeof( int16_t );
 
             std::lock_guard<std::mutex> lock( mutex );
+            LastProcess = std::chrono::steady_clock::now();
 
             // Reserved to uCap in Start(), and never grown past it, so none of this
             // allocates on the data thread.
@@ -773,14 +778,18 @@ struct AudioCapture
         Api.stream_queue_buffer( pStream, pBuf );
     }
 
-    size_t Take( int16_t *pOut, size_t uWant )
+    void Take( std::vector<int16_t> &out, size_t uNominal )
     {
         std::lock_guard<std::mutex> lock( mutex );
 
-        const size_t uGot = std::min( uWant, Ring.size() );
-        memcpy( pOut, Ring.data(), uGot * sizeof( int16_t ) );
-        Ring.erase( Ring.begin(), Ring.begin() + uGot );
-        return uGot;
+        if ( Ring.empty() && std::chrono::steady_clock::now() - LastProcess > k_msAudioIdle )
+        {
+            out.assign( uNominal, 0 );
+            return;
+        }
+
+        out.assign( Ring.begin(), Ring.end() );
+        Ring.clear();
     }
 
     bool Connect();
@@ -951,20 +960,16 @@ struct AudioCapture
     const char *SinkName() const { return ""; }
     bool Start() { return false; }
     void Stop() {}
-    size_t Take( int16_t *, size_t ) { return 0; }
+    void Take( std::vector<int16_t> &out, size_t uNominal ) { out.assign( uNominal, 0 ); }
 };
 
 AudioCapture g_Audio;
 
 #endif // HAVE_PIPEWIRE_AUDIO
 
-// One tick's worth of samples, whatever the capture managed to supply.
-//
-// The count is what matters, not the content: the frontend runs on an audio clock, so
-// handing it less than a video frame's worth makes it call retro_run again to refill,
-// and handing it more makes it skip a call -- which here costs a video frame. So always
-// exactly nominal, padded with silence when the client is quiet or there is no capture
-// at all, and the ring drops its oldest samples rather than let a backlog build.
+// Everything the capture has, which may be nothing between the graph's quanta; the
+// frontend's own buffering evens that out. Nominal silence while the capture is idle,
+// so the frontend's buffer is already full when sound starts.
 void PublishAudio()
 {
     if ( !audio_batch_cb )
@@ -973,14 +978,9 @@ void PublishAudio()
     const double flFps = g_Session.flFps > 0.0 ? g_Session.flFps : 60.0;
     const size_t uFrames = size_t( double( k_uAudioRate ) / flFps );
 
-    if ( g_Session.Audio.size() != uFrames * 2 )
-        g_Session.Audio.assign( uFrames * 2, 0 );
-
-    const size_t uGot = g_Audio.Take( g_Session.Audio.data(), g_Session.Audio.size() );
-    if ( uGot < g_Session.Audio.size() )
-        memset( g_Session.Audio.data() + uGot, 0, ( g_Session.Audio.size() - uGot ) * sizeof( int16_t ) );
-
-    audio_batch_cb( g_Session.Audio.data(), uFrames );
+    g_Audio.Take( g_Session.Audio, uFrames * 2 );
+    if ( !g_Session.Audio.empty() )
+        audio_batch_cb( g_Session.Audio.data(), g_Session.Audio.size() / 2 );
 }
 
 // ---------------------------------------------------------------------------
