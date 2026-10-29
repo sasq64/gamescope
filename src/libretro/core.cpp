@@ -18,6 +18,7 @@
 #include "gamescope_libretro_ipc.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -61,6 +62,12 @@ retro_environment_t        env_cb;
 retro_video_refresh_t      video_cb;
 retro_audio_sample_t       audio_cb;
 retro_audio_sample_batch_t audio_batch_cb;
+
+// demarc's own: offered in answer to RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT (see
+// retro_emu.rs in demarc), so samples past full scale reach it unclipped.
+#define RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT ( RETRO_ENVIRONMENT_PRIVATE | 1 )
+typedef size_t ( *retro_audio_sample_batch_float_t )( const float *data, size_t frames );
+retro_audio_sample_batch_float_t audio_batch_float_cb;
 retro_input_poll_t         input_poll_cb;
 retro_input_state_t        input_state_cb;
 retro_log_printf_t         log_cb;
@@ -222,8 +229,11 @@ struct Session
     int nHiddenSlot = -1;
     std::vector<uint32_t> Black;
 
-    // The buffer PublishAudio hands the frontend, and the pointer state we last sent.
-    std::vector<int16_t> Audio;
+    // The buffers PublishAudio hands the frontend, and the pointer state we last sent.
+    std::vector<float>   Audio;
+    std::vector<int16_t> Audio16;
+    // Peak follower of the limiter that stands in for clipping on the int16 path.
+    float    flPeak = 1.0f;
     int16_t  nLastMouseButtons = 0;
     int16_t  nLastPointerX = 0;
     int16_t  nLastPointerY = 0;
@@ -646,6 +656,9 @@ const size_t k_uAudioRate = 48000;
 // How long without a buffer from the graph before the capture counts as idle.
 const std::chrono::milliseconds k_msAudioIdle( 100 );
 
+// Per-frame decay of the int16 limiter's peak follower: about 200 ms back to unity gain.
+const float k_flLimiterRelease = 0.99990f;
+
 #if HAVE_PIPEWIRE_AUDIO
 
 struct PwApi
@@ -737,7 +750,7 @@ struct AudioCapture
 
     // Written by the PipeWire data thread, read by retro_run.
     std::mutex           mutex;
-    std::vector<int16_t> Ring;
+    std::vector<float>   Ring;
     size_t               uCap = 0;
     std::chrono::steady_clock::time_point LastProcess{};
 
@@ -755,8 +768,9 @@ struct AudioCapture
         const spa_data &data = pBuf->buffer->datas[ 0 ];
         if ( data.data && data.chunk && data.chunk->size )
         {
-            const int16_t *pSamples = (const int16_t *)( (const uint8_t *)data.data + data.chunk->offset );
-            const size_t uCount = data.chunk->size / sizeof( int16_t );
+            // Float, so whatever the client sends past full scale is still there.
+            const float *pSamples = (const float *)( (const uint8_t *)data.data + data.chunk->offset );
+            const size_t uCount = data.chunk->size / sizeof( float );
 
             std::lock_guard<std::mutex> lock( mutex );
             LastProcess = std::chrono::steady_clock::now();
@@ -778,13 +792,13 @@ struct AudioCapture
         Api.stream_queue_buffer( pStream, pBuf );
     }
 
-    void Take( std::vector<int16_t> &out, size_t uNominal )
+    void Take( std::vector<float> &out, size_t uNominal )
     {
         std::lock_guard<std::mutex> lock( mutex );
 
         if ( Ring.empty() && std::chrono::steady_clock::now() - LastProcess > k_msAudioIdle )
         {
-            out.assign( uNominal, 0 );
+            out.assign( uNominal, 0.0f );
             return;
         }
 
@@ -925,7 +939,7 @@ bool AudioCapture::Connect()
     Api.stream_add_listener( pStream, &Hook, &k_StreamEvents, this );
 
     spa_audio_info_raw info = {};
-    info.format = SPA_AUDIO_FORMAT_S16;
+    info.format = SPA_AUDIO_FORMAT_F32;
     info.rate = k_uAudioRate;
     info.channels = 2;
     info.position[ 0 ] = SPA_AUDIO_CHANNEL_FL;
@@ -960,7 +974,7 @@ struct AudioCapture
     const char *SinkName() const { return ""; }
     bool Start() { return false; }
     void Stop() {}
-    void Take( std::vector<int16_t> &out, size_t uNominal ) { out.assign( uNominal, 0 ); }
+    void Take( std::vector<float> &out, size_t uNominal ) { out.assign( uNominal, 0.0f ); }
 };
 
 AudioCapture g_Audio;
@@ -972,15 +986,36 @@ AudioCapture g_Audio;
 // so the frontend's buffer is already full when sound starts.
 void PublishAudio()
 {
-    if ( !audio_batch_cb )
+    if ( !audio_batch_cb && !audio_batch_float_cb )
         return;
 
     const double flFps = g_Session.flFps > 0.0 ? g_Session.flFps : 60.0;
     const size_t uFrames = size_t( double( k_uAudioRate ) / flFps );
 
-    g_Audio.Take( g_Session.Audio, uFrames * 2 );
-    if ( !g_Session.Audio.empty() )
-        audio_batch_cb( g_Session.Audio.data(), g_Session.Audio.size() / 2 );
+    std::vector<float> &audio = g_Session.Audio;
+    g_Audio.Take( audio, uFrames * 2 );
+    if ( audio.empty() )
+        return;
+
+    if ( audio_batch_float_cb )
+    {
+        audio_batch_float_cb( audio.data(), audio.size() / 2 );
+        return;
+    }
+
+    // A peak limiter rather than clipping what goes past full scale.
+    std::vector<int16_t> &audio16 = g_Session.Audio16;
+    audio16.resize( audio.size() );
+    for ( size_t i = 0; i < audio.size(); i += 2 )
+    {
+        const float flL = audio[ i ];
+        const float flR = audio[ i + 1 ];
+        g_Session.flPeak = std::max( { g_Session.flPeak * k_flLimiterRelease, 1.0f, fabsf( flL ), fabsf( flR ) } );
+        const float flGain = 32767.0f / g_Session.flPeak;
+        audio16[ i ] = int16_t( flL * flGain );
+        audio16[ i + 1 ] = int16_t( flR * flGain );
+    }
+    audio_batch_cb( audio16.data(), audio16.size() / 2 );
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,6 +1927,10 @@ RETRO_API void retro_init( void )
     retro_log_callback logging = {};
     if ( env_cb && env_cb( RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging ) )
         log_cb = logging.log;
+
+    audio_batch_float_cb = nullptr;
+    if ( env_cb && !env_cb( RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT, &audio_batch_float_cb ) )
+        audio_batch_float_cb = nullptr;
 }
 
 RETRO_API void retro_deinit( void )
