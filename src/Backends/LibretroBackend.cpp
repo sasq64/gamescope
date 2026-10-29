@@ -583,9 +583,9 @@ namespace gamescope
                 case GSLR_INPUT_WARP:
                     wlserver_lock();
                     // Into the focused window's own pixels, as wlserver_touchmotion does.
-                    wlserver_mousewarp( ( input.x * g_nOutputWidth + focusedWindowOffsetX ) * focusedWindowScaleX,
-                                        ( input.y * g_nOutputHeight + focusedWindowOffsetY ) * focusedWindowScaleY,
-                                        uSequence, true );
+                    wlserver_mousewarp_raw( ( input.x * g_nOutputWidth + focusedWindowOffsetX ) * focusedWindowScaleX,
+                                            ( input.y * g_nOutputHeight + focusedWindowOffsetY ) * focusedWindowScaleY,
+                                            uSequence );
                     wlserver_unlock();
                     break;
 

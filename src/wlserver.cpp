@@ -2989,6 +2989,28 @@ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 }
 
+// wine moves its cursor by XInput2 raw motion alone, which a warp does not make:
+// pin it to the corner once, then move it by the difference before each warp.
+void wlserver_mousewarp_raw( double x, double y, uint32_t time )
+{
+	assert( wlserver_is_lock_held() );
+
+	static bool s_bRawKnown = false;
+	static double s_flRawX = 0.0, s_flRawY = 0.0;
+
+	if ( !s_bRawKnown )
+	{
+		wlserver_perform_rel_pointer_motion( -100000.0, -100000.0 );
+		s_bRawKnown = true;
+	}
+	if ( x != s_flRawX || y != s_flRawY )
+		wlserver_perform_rel_pointer_motion( x - s_flRawX, y - s_flRawY );
+	s_flRawX = x;
+	s_flRawY = y;
+
+	wlserver_mousewarp( x, y, time, true );
+}
+
 void wlserver_fake_mouse_pos( double x, double y )
 {
 	// Fake a pos for eg. hiding true cursor state from Steam.
