@@ -101,6 +101,7 @@ const retro_variable k_Variables[] = {
     { "gamescope_mesa_glsl_version", "force_glsl_version for the client; " },
     { "gamescope_mesa_allow_glsl_120_subset_in_110", "allow_glsl_120_subset_in_110 for the client; false|true" },
     { "gamescope_close_prefix", "Shut the WINEPREFIX down on unload; true|false" },
+    { "gamescope_chrome_args", "Extra arguments for a chrome client; " },
     { "gamescope_audio", "Capture the client's audio instead of letting it play to the desktop; true|false" },
     { nullptr, nullptr },
 };
@@ -557,6 +558,8 @@ Client BuildClient( const std::string &strPath )
             // textures are refused without the web server such a release ships.
             "--allow-file-access-from-files",
         };
+        for ( const std::string &strArg : SplitWords( GetOption( "gamescope_chrome_args", "" ) ) )
+            client.argv.push_back( strArg );
         return client;
     }
 
