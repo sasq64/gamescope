@@ -656,8 +656,9 @@ const size_t k_uAudioLatencyMs = 120;
 // What retro_get_system_av_info reports, so the two have to agree.
 const size_t k_uAudioRate = 48000;
 
-// How long without a buffer from the graph before the capture counts as idle.
-const std::chrono::milliseconds k_msAudioIdle( 100 );
+// Slack on top of two graph periods without a buffer before the capture counts as
+// stalled. The graph can pause for over 100ms while a client's stream joins it.
+const std::chrono::milliseconds k_msAudioStallSlack( 10 );
 
 // Per-frame decay of the int16 limiter's peak follower: about 200 ms back to unity gain.
 const float k_flLimiterRelease = 0.99990f;
@@ -756,6 +757,7 @@ struct AudioCapture
     std::vector<float>   Ring;
     size_t               uCap = 0;
     std::chrono::steady_clock::time_point LastProcess{};
+    std::chrono::steady_clock::duration   LastPeriod{};
 
     std::string strSink;
 
@@ -777,6 +779,8 @@ struct AudioCapture
 
             std::lock_guard<std::mutex> lock( mutex );
             LastProcess = std::chrono::steady_clock::now();
+            LastPeriod = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>( double( uCount / 2 ) / k_uAudioRate ) );
 
             // Reserved to uCap in Start(), and never grown past it, so none of this
             // allocates on the data thread.
@@ -799,7 +803,7 @@ struct AudioCapture
     {
         std::lock_guard<std::mutex> lock( mutex );
 
-        if ( Ring.empty() && std::chrono::steady_clock::now() - LastProcess > k_msAudioIdle )
+        if ( Ring.empty() && std::chrono::steady_clock::now() - LastProcess > 2 * LastPeriod + k_msAudioStallSlack )
         {
             out.assign( uNominal, 0.0f );
             return;
