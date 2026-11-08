@@ -124,7 +124,7 @@ jobs:
             -Dpipewire=disabled \
             -Davif_screenshots=disabled \
             -Dforce_fallback_for=libliftoff,vkroots
-          ninja -C build-lr src/gamescope src/gamescope_libretro.so
+          ninja -C build-lr src/gamescope src/gamescope_libretro.so src/gamescopereaper
 
       # The zip is one directory: the core at the top, because that is the only file
       # demarc's libloader.rs looks for, the compositor beside it, because that is
@@ -184,7 +184,7 @@ jobs:
             fi
           done
 
-          strip --strip-unneeded "$stage/gamescope" "$stage/gamescope_libretro.so" "$stage"/lib/*.so* || true
+          strip --strip-unneeded "$stage/gamescope" "$stage/gamescopereaper" "$stage/gamescope_libretro.so" "$stage"/lib/*.so* || true
           patchelf --force-rpath --set-rpath '$ORIGIN/lib' "$stage/gamescope"
           for lib in "$stage"/lib/*.so*; do
             patchelf --force-rpath --set-rpath '$ORIGIN' "$lib"
