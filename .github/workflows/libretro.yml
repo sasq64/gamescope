@@ -142,7 +142,8 @@ jobs:
           mkdir -p "$stage/lib"
           cp build-lr/src/gamescope "$stage/gamescope"
           cp build-lr/src/gamescope_libretro.so "$stage/gamescope_libretro.so"
-          chmod +x "$stage/gamescope"
+          cp build-lr/src/gamescopereaper "$stage/gamescopereaper"
+          chmod +x "$stage/gamescope" "$stage/gamescopereaper"
 
           # What is left to the host, because it already has it or must own it: the
           # C/C++ runtime, the graphics stack its Vulkan driver is built against, X11,

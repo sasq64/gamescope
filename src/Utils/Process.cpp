@@ -507,7 +507,18 @@ namespace gamescope::Process
     pid_t SpawnProcessInWatchdog( char **argv, bool bRespawn, std::function<void()> fnPreambleInChild )
     {
         std::vector<char *> args;
-        args.push_back( (char *)"gamescopereaper" );
+        static std::string s_strReaper = []() -> std::string
+        {
+            char szExe[ PATH_MAX ];
+            ssize_t nLen = readlink( "/proc/self/exe", szExe, sizeof( szExe ) - 1 );
+            if ( nLen <= 0 )
+                return "gamescopereaper";
+            std::string strBeside( szExe, nLen );
+            strBeside.resize( strBeside.rfind( '/' ) + 1 );
+            strBeside += "gamescopereaper";
+            return access( strBeside.c_str(), X_OK ) == 0 ? strBeside : "gamescopereaper";
+        }();
+        args.push_back( (char *)s_strReaper.c_str() );
         if ( bRespawn )
             args.push_back( (char *)"--respawn" );
         args.push_back( (char *)"--" );
