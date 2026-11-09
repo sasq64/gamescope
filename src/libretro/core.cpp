@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <dirent.h>
@@ -1041,9 +1042,9 @@ struct Pauser
     bool bQuit = false;
 } g_Pauser;
 
-// wine setsid()s every process it starts, so signalling the group misses them; take
+// wine setsid()s every process it starts, so the group alone misses them; take
 // everything in the group and every descendant of it instead.
-void SignalSession( pid_t nGroup, int nSignal )
+std::vector<pid_t> SessionTree( pid_t nGroup )
 {
     struct Proc { pid_t pid, ppid, pgid; };
     std::vector<Proc> procs;
@@ -1092,7 +1093,12 @@ void SignalSession( pid_t nGroup, int nSignal )
         }
     }
 
-    for ( pid_t pid : tree )
+    return tree;
+}
+
+void SignalSession( pid_t nGroup, int nSignal )
+{
+    for ( pid_t pid : SessionTree( nGroup ) )
         kill( pid, nSignal );
 }
 
@@ -1616,6 +1622,259 @@ void ReleaseSlot( int nSlot )
     SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
 }
 
+// ---------------------------------------------------------------------------
+// CPU indicator: until the session first shows something, a small bar in the corner
+// shows how busy its wine processes are, so a precalc is not mistaken for a hang.
+// ---------------------------------------------------------------------------
+
+const std::chrono::milliseconds k_msIndicatorDelay( 2000 );
+const std::chrono::milliseconds k_msLoadSample( 500 );
+
+struct Indicator
+{
+    std::chrono::steady_clock::time_point start;
+    bool bSeenContent = false;
+
+    std::chrono::steady_clock::time_point lastSample;
+    std::unordered_map<pid_t, uint64_t> CpuTicks;
+    // GPU busy time per DRM client, summed over its engines.
+    std::unordered_map<uint64_t, uint64_t> GpuNs;
+    float flCpu = -1.0f;
+    float flGpu = -1.0f;
+
+    // The bars on screen, -1 when the frontend shows something else.
+    int nDrawnFill = -1;
+    std::vector<uint32_t> Pixels;
+} g_Indicator;
+
+void ResetIndicator()
+{
+    g_Indicator.start = std::chrono::steady_clock::now();
+    g_Indicator.bSeenContent = false;
+    g_Indicator.CpuTicks.clear();
+    g_Indicator.GpuNs.clear();
+    g_Indicator.flCpu = -1.0f;
+    g_Indicator.flGpu = -1.0f;
+    g_Indicator.nDrawnFill = -1;
+}
+
+bool IndicatorDue()
+{
+    return !g_Indicator.bSeenContent &&
+           std::chrono::steady_clock::now() - g_Indicator.start >= k_msIndicatorDelay;
+}
+
+// A wine process runs wine's loader whatever its Windows name, which may lack ".exe".
+bool IsExeProcess( pid_t pid )
+{
+    char szPath[ 64 ], szBuf[ PATH_MAX ];
+    snprintf( szPath, sizeof( szPath ), "/proc/%d/exe", pid );
+    ssize_t n = readlink( szPath, szBuf, sizeof( szBuf ) - 1 );
+    if ( n > 0 )
+    {
+        szBuf[ n ] = 0;
+        const char *pszName = strrchr( szBuf, '/' );
+        pszName = pszName ? pszName + 1 : szBuf;
+        if ( !strncmp( pszName, "wine", 4 ) && strcmp( pszName, "wineserver" ) )
+            return true;
+    }
+
+    snprintf( szPath, sizeof( szPath ), "/proc/%d/cmdline", pid );
+    int fd = open( szPath, O_RDONLY | O_CLOEXEC );
+    if ( fd < 0 )
+        return false;
+    n = read( fd, szBuf, sizeof( szBuf ) - 1 );
+    close( fd );
+    if ( n <= 0 )
+        return false;
+    szBuf[ n ] = 0;
+    return EndsWith( ToLower( szBuf ), ".exe" );
+}
+
+bool ReadCpuTicks( pid_t pid, uint64_t &ulTicks )
+{
+    char szPath[ 64 ], szStat[ 1024 ];
+    snprintf( szPath, sizeof( szPath ), "/proc/%d/stat", pid );
+    int fd = open( szPath, O_RDONLY | O_CLOEXEC );
+    if ( fd < 0 )
+        return false;
+    ssize_t n = read( fd, szStat, sizeof( szStat ) - 1 );
+    close( fd );
+    if ( n <= 0 )
+        return false;
+    szStat[ n ] = 0;
+
+    const char *pszEnd = strrchr( szStat, ')' );
+    unsigned long long ulUser, ulSystem;
+    if ( !pszEnd || sscanf( pszEnd + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+                            &ulUser, &ulSystem ) != 2 )
+        return false;
+    ulTicks = ulUser + ulSystem;
+    return true;
+}
+
+// Adds the GPU time of every DRM client the process has open, as fdinfo reports it
+// (amdgpu, i915, msm, panfrost and v3d do; NVIDIA's driver does not).
+void ReadGpuNs( pid_t pid, std::unordered_map<uint64_t, uint64_t> &gpuNs )
+{
+    char szPath[ 64 ];
+    snprintf( szPath, sizeof( szPath ), "/proc/%d/fd", pid );
+    DIR *pDir = opendir( szPath );
+    if ( !pDir )
+        return;
+
+    while ( dirent *pEnt = readdir( pDir ) )
+    {
+        if ( pEnt->d_name[0] == '.' )
+            continue;
+
+        char szFd[ 320 ], szLink[ 64 ];
+        snprintf( szFd, sizeof( szFd ), "/proc/%d/fd/%s", pid, pEnt->d_name );
+        ssize_t n = readlink( szFd, szLink, sizeof( szLink ) - 1 );
+        if ( n <= 0 )
+            continue;
+        szLink[ n ] = 0;
+        if ( strncmp( szLink, "/dev/dri/", 9 ) )
+            continue;
+
+        snprintf( szFd, sizeof( szFd ), "/proc/%d/fdinfo/%s", pid, pEnt->d_name );
+        FILE *pFile = fopen( szFd, "re" );
+        if ( !pFile )
+            continue;
+
+        uint64_t ulClient = 0, ulNs = 0;
+        bool bClient = false;
+        char szLine[ 256 ];
+        while ( fgets( szLine, sizeof( szLine ), pFile ) )
+        {
+            unsigned long long ull;
+            if ( sscanf( szLine, "drm-client-id: %llu", &ull ) == 1 )
+            {
+                ulClient = ull;
+                bClient = true;
+            }
+            else if ( !strncmp( szLine, "drm-engine-", 11 ) && strncmp( szLine, "drm-engine-capacity-", 20 ) )
+            {
+                const char *pszColon = strchr( szLine, ':' );
+                if ( pszColon && sscanf( pszColon + 1, " %llu ns", &ull ) == 1 )
+                    ulNs += ull;
+            }
+        }
+        fclose( pFile );
+
+        if ( bClient )
+            gpuNs[ ulClient ] = ulNs;
+    }
+    closedir( pDir );
+}
+
+// CPU load of the busiest wine process, 1.0 being one core, and GPU load of all of
+// them together; -1 until two samples are in hand.
+void SampleLoad()
+{
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = now - g_Indicator.lastSample;
+    if ( elapsed < k_msLoadSample )
+        return;
+
+    const bool bBaseline = elapsed > 2 * k_msLoadSample;
+    const double flSeconds = std::chrono::duration<double>( elapsed ).count();
+    const double flTicks = flSeconds * sysconf( _SC_CLK_TCK );
+
+    std::unordered_map<pid_t, uint64_t> cpuTicks;
+    std::unordered_map<uint64_t, uint64_t> gpuNs;
+    float flCpu = 0.0f;
+    for ( pid_t pid : SessionTree( g_Session.nChild ) )
+    {
+        uint64_t ulTicks;
+        if ( !IsExeProcess( pid ) || !ReadCpuTicks( pid, ulTicks ) )
+            continue;
+        cpuTicks[ pid ] = ulTicks;
+        auto it = g_Indicator.CpuTicks.find( pid );
+        if ( it != g_Indicator.CpuTicks.end() && ulTicks >= it->second )
+            flCpu = std::max( flCpu, float( ( ulTicks - it->second ) / flTicks ) );
+        ReadGpuNs( pid, gpuNs );
+    }
+
+    uint64_t ulGpuNs = 0;
+    for ( const auto &[ ulClient, ulNs ] : gpuNs )
+    {
+        auto it = g_Indicator.GpuNs.find( ulClient );
+        if ( it != g_Indicator.GpuNs.end() && ulNs >= it->second )
+            ulGpuNs += ulNs - it->second;
+    }
+
+    g_Indicator.CpuTicks.swap( cpuTicks );
+    g_Indicator.GpuNs.swap( gpuNs );
+    g_Indicator.lastSample = now;
+    g_Indicator.flCpu = bBaseline ? -1.0f : flCpu;
+    g_Indicator.flGpu = bBaseline ? -1.0f : float( ulGpuNs / ( flSeconds * 1e9 ) );
+}
+
+bool IsBlack( const uint8_t *pPixels, uint32_t uStride )
+{
+    for ( unsigned y = 0; y < g_Session.uHeight; y += 16 )
+    {
+        const uint32_t *pRow = reinterpret_cast<const uint32_t *>( pPixels + size_t( y ) * uStride );
+        for ( unsigned x = 0; x < g_Session.uWidth; x += 16 )
+        {
+            if ( pRow[ x ] & 0xffffff )
+                return false;
+        }
+    }
+    return true;
+}
+
+// CPU above, GPU below. Returns false when there is no load to show yet.
+bool PublishIndicator()
+{
+    SampleLoad();
+    if ( g_Indicator.flCpu < 0.0f )
+        return false;
+
+    const unsigned uWidth = g_Session.uWidth, uHeight = g_Session.uHeight;
+    const unsigned uBoxW = std::max( 24u, uWidth / 24 );
+    const unsigned uBarH = std::max( 2u, uHeight / 270 );
+    const unsigned uBoxH = 2 * uBarH + 3;
+    const unsigned uMargin = uBarH * 2;
+    const unsigned uInner = uBoxW - 2;
+    auto fill = [ uInner ]( float flLoad ) { return int( std::lround( std::clamp( flLoad, 0.0f, 1.0f ) * uInner ) ); };
+    const int nCpu = fill( g_Indicator.flCpu );
+    const int nGpu = fill( g_Indicator.flGpu );
+    const int nKey = nCpu * 65536 + nGpu;
+
+    if ( nKey == g_Indicator.nDrawnFill )
+    {
+        video_cb( nullptr, uWidth, uHeight, 0 );
+        return true;
+    }
+
+    std::vector<uint32_t> &pixels = g_Indicator.Pixels;
+    if ( pixels.size() != size_t( uWidth ) * uHeight )
+        pixels.assign( size_t( uWidth ) * uHeight, 0 );
+
+    for ( unsigned y = 0; y < uBoxH; y++ )
+    {
+        uint32_t *pRow = &pixels[ size_t( uMargin + y ) * uWidth + uMargin ];
+        const bool bEdge = y == 0 || y == uBarH + 1 || y == uBoxH - 1;
+        const int nFill = y <= uBarH ? nCpu : nGpu;
+        for ( unsigned x = 0; x < uBoxW; x++ )
+        {
+            uint32_t uColor = 0;
+            if ( bEdge || x == 0 || x == uBoxW - 1 )
+                uColor = 0x808080;
+            else if ( int( x - 1 ) < nFill )
+                uColor = 0xc0c0c0;
+            pRow[ x ] = uColor;
+        }
+    }
+
+    video_cb( pixels.data(), uWidth, uHeight, uWidth * 4 );
+    g_Indicator.nDrawnFill = nKey;
+    return true;
+}
+
+// A black frame is not shown while the indicator is up, so the bar stays.
 void PublishFrame( int nSlot )
 {
     const Buffer &buffer = g_Session.Buffers[ nSlot ];
@@ -1623,11 +1882,24 @@ void PublishFrame( int nSlot )
         return;
 
     DmaSync( buffer, DMA_BUF_SYNC_START );
-    video_cb( buffer.pMap + buffer.uOffset, g_Session.uWidth, g_Session.uHeight, buffer.uStride );
+    const uint8_t *pPixels = buffer.pMap + buffer.uOffset;
+    const bool bBlack = !g_Indicator.bSeenContent && IsBlack( pPixels, buffer.uStride );
+    if ( !bBlack )
+        g_Indicator.bSeenContent = true;
+    const bool bShow = !bBlack || !IndicatorDue();
+    if ( bShow )
+    {
+        video_cb( pPixels, g_Session.uWidth, g_Session.uHeight, buffer.uStride );
+        g_Session.nLastSlot = nSlot;
+        g_Indicator.nDrawnFill = -1;
+    }
     DmaSync( buffer, DMA_BUF_SYNC_END );
 
     // The frontend copied the pixels inside video_refresh, so the slot is free again.
     ReleaseSlot( nSlot );
+
+    if ( !bShow && !PublishIndicator() )
+        video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
 }
 
 void PublishBlack()
@@ -1638,6 +1910,7 @@ void PublishBlack()
 
     video_cb( g_Session.Black.data(), g_Session.uWidth, g_Session.uHeight,
               g_Session.uWidth * 4 );
+    g_Indicator.nDrawnFill = -1;
 }
 
 // A client that changes mode changes how much of the session it covers, which is the
@@ -1988,6 +2261,7 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
     g_Session.bReportedExit = false;
     g_Session.bHiding = false;
     g_Session.uHideTicks = 0;
+    ResetIndicator();
 
     StartPauseWatchdog();
 
@@ -2039,7 +2313,8 @@ RETRO_API void retro_run( void )
                 ReleaseSlot( g_Session.nHiddenSlot );
             g_Session.nHiddenSlot = nSlot;
         }
-        PublishBlack();
+        if ( !IndicatorDue() || !PublishIndicator() )
+            PublishBlack();
     }
     else if ( g_Session.nHiddenSlot >= 0 )
     {
@@ -2049,18 +2324,17 @@ RETRO_API void retro_run( void )
             nSlot = g_Session.nHiddenSlot;
         g_Session.nHiddenSlot = -1;
         PublishFrame( nSlot );
-        g_Session.nLastSlot = nSlot;
     }
     else if ( nSlot >= 0 )
     {
         PublishFrame( nSlot );
-        g_Session.nLastSlot = nSlot;
     }
     else
     {
         // A dupe. The frontend advertises GET_CAN_DUPE, so a null frame means
         // "same as last time" and costs it no upload.
-        video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
+        if ( !IndicatorDue() || !PublishIndicator() )
+            video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
     }
 
     PublishAudio();
