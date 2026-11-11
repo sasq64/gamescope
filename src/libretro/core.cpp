@@ -69,6 +69,23 @@ retro_audio_sample_batch_t audio_batch_cb;
 #define RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT ( RETRO_ENVIRONMENT_PRIVATE | 1 )
 typedef size_t ( *retro_audio_sample_batch_float_t )( const float *data, size_t frames );
 retro_audio_sample_batch_float_t audio_batch_float_cb;
+
+// demarc's own: the frontend imports the ring into its GPU and copies each frame out
+// there, so it gives a slot back through `release` instead of during video_refresh.
+#define RETRO_ENVIRONMENT_DEMARC_DMABUF ( RETRO_ENVIRONMENT_PRIVATE | 2 )
+struct demarc_dmabuf_iface
+{
+    // Filled in by the frontend.
+    bool ( *set_buffers )( unsigned width, unsigned height, uint32_t drm_format, unsigned count,
+                           const int *fds, const uint32_t *stride, const uint32_t *offset,
+                           const uint64_t *size );
+    // false: the frontend wants this one through video_refresh.
+    bool ( *present )( unsigned slot );
+    // Filled in by the core. Called from any thread.
+    void ( *release )( unsigned slot );
+};
+demarc_dmabuf_iface g_Dmabuf;
+bool g_bDmabuf = false;
 retro_input_poll_t         input_poll_cb;
 retro_input_state_t        input_state_cb;
 retro_log_printf_t         log_cb;
@@ -199,6 +216,8 @@ struct Session
 
     Buffer   Buffers[ GSLR_NUM_BUFFERS ];
     uint32_t uNumBuffers = 0;
+    uint32_t uDrmFormat = 0;
+    uint64_t ulModifier = 0;
 
     unsigned uWidth = 800;
     unsigned uHeight = 600;
@@ -247,8 +266,12 @@ struct Session
 // video_refresh takes a pitch, so the mapping is passed through untouched.
 std::vector<uint8_t> g_Scratch;
 
+// RELEASE also comes from the frontend's GPU completion thread.
+std::mutex g_SendLock;
+
 bool SendControl( uint32_t uType, const void *pPayload, size_t uLen )
 {
+    std::lock_guard<std::mutex> lock( g_SendLock );
     if ( g_Session.nSocket < 0 )
         return false;
 
@@ -1173,6 +1196,7 @@ void CloseSession()
 
     if ( g_Session.nSocket >= 0 )
     {
+        std::lock_guard<std::mutex> lock( g_SendLock );
         shutdown( g_Session.nSocket, SHUT_RDWR );
         close( g_Session.nSocket );
         g_Session.nSocket = -1;
@@ -1510,7 +1534,8 @@ bool AwaitHello( int nTimeoutMs )
             gslr_hello  hello;
         } msg = {};
 
-        int nFds[ GSLR_NUM_BUFFERS ] = { -1, -1, -1 };
+        int nFds[ GSLR_NUM_BUFFERS ];
+        std::fill( std::begin( nFds ), std::end( nFds ), -1 );
 
         iovec iov = { &msg, sizeof( msg ) };
         alignas( cmsghdr ) char cmsgBuf[ CMSG_SPACE( sizeof( int ) * GSLR_NUM_BUFFERS ) ] = {};
@@ -1584,6 +1609,8 @@ bool AwaitHello( int nTimeoutMs )
         }
 
         g_Session.uNumBuffers = uNumFds;
+        g_Session.uDrmFormat = msg.hello.drm_format;
+        g_Session.ulModifier = msg.hello.modifier;
         g_Session.uWidth = msg.hello.width;
         g_Session.uHeight = msg.hello.height;
         if ( msg.hello.refresh_mhz )
@@ -1620,6 +1647,44 @@ void ReleaseSlot( int nSlot )
     gslr_release release = {};
     release.slot = uint32_t( nSlot );
     SendControl( GSLR_MSG_RELEASE, &release, sizeof( release ) );
+}
+
+void DmabufRelease( unsigned uSlot )
+{
+    ReleaseSlot( int( uSlot ) );
+}
+
+// Only a linear ring can be read by the frontend as a plain buffer. The ring is
+// mappable, so linear-tiled, and an implicit modifier means that too.
+void OfferBuffers()
+{
+    g_bDmabuf = false;
+    if ( !g_Dmabuf.set_buffers || !g_Dmabuf.present )
+        return;
+
+    const uint64_t ulLinear = 0, ulImplicit = 0x00ffffffffffffffull;
+    if ( g_Session.ulModifier != ulLinear && g_Session.ulModifier != ulImplicit )
+    {
+        log_line( RETRO_LOG_INFO, "ring has modifier %#llx, not offering it to the GPU",
+                  (unsigned long long)g_Session.ulModifier );
+        return;
+    }
+
+    int nFds[ GSLR_NUM_BUFFERS ];
+    uint32_t uStride[ GSLR_NUM_BUFFERS ], uOffset[ GSLR_NUM_BUFFERS ];
+    uint64_t ulSize[ GSLR_NUM_BUFFERS ];
+    for ( unsigned i = 0; i < g_Session.uNumBuffers; i++ )
+    {
+        nFds[i] = g_Session.Buffers[i].nFd;
+        uStride[i] = g_Session.Buffers[i].uStride;
+        uOffset[i] = g_Session.Buffers[i].uOffset;
+        ulSize[i] = g_Session.Buffers[i].uSize;
+    }
+
+    g_bDmabuf = g_Dmabuf.set_buffers( g_Session.uWidth, g_Session.uHeight, g_Session.uDrmFormat,
+                                      g_Session.uNumBuffers, nFds, uStride, uOffset, ulSize );
+    log_line( RETRO_LOG_INFO, "frontend %s the ring on its GPU",
+              g_bDmabuf ? "copies" : "does not copy" );
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,16 +1952,21 @@ void PublishFrame( int nSlot )
     if ( !bBlack )
         g_Indicator.bSeenContent = true;
     const bool bShow = !bBlack || !IndicatorDue();
+    bool bGpu = false;
     if ( bShow )
     {
-        video_cb( pPixels, g_Session.uWidth, g_Session.uHeight, buffer.uStride );
+        bGpu = g_bDmabuf && g_Dmabuf.present( unsigned( nSlot ) );
+        if ( !bGpu )
+            video_cb( pPixels, g_Session.uWidth, g_Session.uHeight, buffer.uStride );
         g_Session.nLastSlot = nSlot;
         g_Indicator.nDrawnFill = -1;
     }
     DmaSync( buffer, DMA_BUF_SYNC_END );
 
-    // The frontend copied the pixels inside video_refresh, so the slot is free again.
-    ReleaseSlot( nSlot );
+    // video_refresh copied the pixels, so the slot is free again. A GPU copy gives it
+    // back through release.
+    if ( !bGpu )
+        ReleaseSlot( nSlot );
 
     if ( !bShow && !PublishIndicator() )
         video_cb( nullptr, g_Session.uWidth, g_Session.uHeight, 0 );
@@ -2211,6 +2281,11 @@ RETRO_API void retro_init( void )
     audio_batch_float_cb = nullptr;
     if ( env_cb && !env_cb( RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT, &audio_batch_float_cb ) )
         audio_batch_float_cb = nullptr;
+
+    g_Dmabuf = {};
+    g_Dmabuf.release = DmabufRelease;
+    if ( !env_cb || !env_cb( RETRO_ENVIRONMENT_DEMARC_DMABUF, &g_Dmabuf ) )
+        g_Dmabuf = {};
 }
 
 RETRO_API void retro_deinit( void )
@@ -2253,6 +2328,8 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
         CloseSession();
         return false;
     }
+
+    OfferBuffers();
 
     g_Session.uUsedWidth = 0;
     g_Session.uUsedHeight = 0;

@@ -13,16 +13,16 @@
 // hello, and thereafter only a slot number moves per frame.
 //
 // Directions are strict: gamescope only ever sends HELLO/FRAME/BYE, the core only
-// ever sends INPUT/RELEASE. Each direction has a single writer thread, so no message
-// interleaves with another.
+// ever sends INPUT/RELEASE. SEQPACKET sends are atomic, so no message interleaves
+// with another.
 
 #include <stdint.h>
 
-#define GSLR_PROTOCOL_VERSION 2u
+#define GSLR_PROTOCOL_VERSION 3u
 
-// Buffers in the ring. Three lets gamescope compose the next frame while the core
-// still holds the last one, without ever waiting on it.
-#define GSLR_NUM_BUFFERS 3u
+// Buffers in the ring. A frontend that copies on the GPU holds a slot for the copy
+// in flight and another for the newest frame, so gamescope needs two more to write.
+#define GSLR_NUM_BUFFERS 4u
 
 enum gslr_msg_type
 {
