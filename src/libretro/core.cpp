@@ -235,6 +235,11 @@ struct Session
     bool bRunning = false;
     bool bReportedExit = false;
 
+    // The client is done (driver said so, or its stdout closed), and whether the
+    // frontend has been asked to unload us for it.
+    bool bClientGone = false;
+    bool bAskedShutdown = false;
+
     // Set when the client was wine, so teardown knows to shut the prefix down.
     std::string strWinePrefix;
 
@@ -2091,9 +2096,14 @@ void OnClientEvent( const std::string &strEvent )
         g_Session.bHiding = true;
         g_Session.uHideTicks = 0;
     }
-    else if ( strEvent == "visible" || strEvent == "exited" || strEvent == "failed" )
+    else if ( strEvent == "visible" )
     {
         g_Session.bHiding = false;
+    }
+    else if ( strEvent == "exited" || strEvent == "failed" )
+    {
+        g_Session.bHiding = false;
+        g_Session.bClientGone = true;
     }
 }
 
@@ -2121,6 +2131,7 @@ void PumpClientOutput()
             close( g_Session.nClientOut );
             g_Session.nClientOut = -1;
             g_Session.bHiding = false;
+            g_Session.bClientGone = true;
             return;
         }
 
@@ -2336,6 +2347,8 @@ RETRO_API bool retro_load_game( const retro_game_info *game )
 
     g_Session.bRunning = true;
     g_Session.bReportedExit = false;
+    g_Session.bClientGone = false;
+    g_Session.bAskedShutdown = false;
     g_Session.bHiding = false;
     g_Session.uHideTicks = 0;
     ResetIndicator();
@@ -2358,6 +2371,14 @@ RETRO_API void retro_unload_game( void )
 RETRO_API void retro_run( void )
 {
     MarkRun();
+
+    if ( ( !g_Session.bRunning || g_Session.bClientGone ) && !g_Session.bAskedShutdown )
+    {
+        log_line( RETRO_LOG_INFO, "the client has exited, asking the frontend to unload" );
+        g_Session.bAskedShutdown = true;
+        if ( env_cb )
+            env_cb( RETRO_ENVIRONMENT_SHUTDOWN, nullptr );
+    }
 
     if ( !g_Session.bRunning )
     {
